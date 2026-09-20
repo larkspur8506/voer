@@ -693,33 +693,92 @@ def _sb_challenge_visible(sb) -> bool:
 
     不能仅凭 page_source 里有 "cf-turnstile" / "challenge-platform" 就判定为需要处理，
     这些 JS/DOM 字符串在 Turnstile 通过后仍然存在于源码中。
-    只有出现明确需要用户交互的提示词（错误信息 / 未通过状态）才算 Challenge 可见。
+    优先通过 WebDriver execute_script 检测实际渲染的 iframe/元素，
+    失败再回退到文本关键词匹配。
     """
+    solved_keywords = [
+        "cf-mark-solved",
+        "cf-circle-checked",
+        "challenge-solved",
+        "security-check-passed",
+        "turnstile-success",
+        "cf-challenge-running/solved",
+    ]
+
     try:
         src = sb.get_page_source() or ""
         low = src.lower()
-        # 真正需要点击的 challenge 特征：
-        #   1. "verify you are human" / "security verification"：登录页 CF 盾的邀请文案
-        #   2. "challenge-platform"：实际渲染出的 challenge iframe 标记
-        # 以下关键词表示已安全/已通过，不应再处理：
-        #   - cf-mark-solved、cf-circle-checked、challenge-solved、security-check-passed
-        solved_keywords = [
-            "cf-mark-solved",
-            "cf-circle-checked",
-            "challenge-solved",
-            "security-check-passed",
-            "turnstile-success",
-            "cf-challenge-running/solved",
-        ]
         if any(kw in low for kw in solved_keywords):
             return False
-        return (
+    except Exception:
+        pass
+
+    # 用 JavaScript 在已渲染的 DOM 中查询实际存在的 Turnstile 元素
+    # 这比源码关键词更可靠，因为 solved 后的页面源码仍含 cf-turnstile 字符串
+    js_checks = []
+    try:
+        driver = getattr(sb, "driver", None)
+        if driver is not None:
+            try:
+                # 1) Turnstile challenge iframe（challenges.cloudflare.com 渲染出的 challenge）
+                n = driver.execute_script(
+                    "return document.querySelectorAll('iframe[src*=\"challenges.cloudflare.com\"]').length"
+                )
+                if int(n or 0) > 0:
+                    log("  [CF] 检测到 challenges.cloudflare.com iframe")
+                    return True
+            except Exception:
+                pass
+            try:
+                # 2) Turnstile response hidden input（challenge 未完成时存在）
+                n = driver.execute_script(
+                    "return document.querySelectorAll('[name=\"cf-turnstile-response\"]').length"
+                )
+                if int(n or 0) > 0:
+                    log("  [CF] 检测到 cf-turnstile-response 元素")
+                    return True
+            except Exception:
+                pass
+            try:
+                # 3) .cf-turnstile wrapper 元素（Turnstile 渲染容器）
+                n = driver.execute_script(
+                    "return document.querySelectorAll('.cf-turnstile').length"
+                )
+                if int(n or 0) > 0:
+                    log("  [CF] 检测到 .cf-turnstile 元素")
+                    return True
+            except Exception:
+                pass
+            try:
+                # 4) [data-sitekey] 元素（Turnstile widget 标记）
+                n = driver.execute_script(
+                    "return document.querySelectorAll('[data-sitekey]').length"
+                )
+                if int(n or 0) > 0:
+                    log("  [CF] 检测到 [data-sitekey] 元素")
+                    return True
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"  [CF] WebDriver 检测异常，回退到文本检测: {e}")
+
+    # 回退：文本关键词（作为最后手段）
+    try:
+        src = sb.get_page_source() or ""
+        low = src.lower()
+        if any(kw in low for kw in solved_keywords):
+            return False
+        if (
             "verify you are human" in low
             or "security verification" in low
             or "challenge-platform" in low
-        )
+        ):
+            log("  [CF] 通过文本关键词检测到 Challenge")
+            return True
     except Exception:
-        return False
+        pass
+
+    return False
 
 
 def _sb_handle_turnstile(sb, max_retry: int = 4) -> bool:
@@ -1401,6 +1460,48 @@ def _confirm_close_click(page, timeout_sec: int) -> bool:
         time.sleep(1)
     log("  [TEST] 等待全屏广告层消失超时")
     return False
+
+
+def _dismiss_unlock_modal(page) -> bool:
+    """检测并处理「Unlock more content」全站广告 modal。
+
+    若存在该 modal，点击「View a short ad」完成单条广告后返回 True；
+    若 modal 不存在则返回 False（不阻塞后续流程）。
+    """
+    try:
+        body_text = page.locator("body").inner_text(timeout=5000) or ""
+    except Exception:
+        return False
+    low = body_text.lower()
+    if not ("unlock more content" in low or "view a short ad" in low or "site-wide access" in low):
+        return False
+    log("检测到「Unlock more content」全站广告 modal，开始处理…")
+    # 点击 View a short ad
+    ad_hit = click_anywhere(
+        page, ["View a short ad", "View short ad", "view a short ad"], 15000
+    )
+    if not ad_hit:
+        log("未找到 View a short ad 按钮，modal 可能已变化，跳过")
+        return False
+    log(f"已点击 View a short ad: {ad_hit}")
+    # 等待 Wormies frame
+    wormies = _wait_for_wormies_frame(page, timeout_sec=120)
+    if not wormies:
+        log("等待 Wormies frame 超时，modal 广告流程中断")
+        return True
+    log("Wormies frame 已出现，等待广告播放…")
+    # 等待约 60 秒
+    time.sleep(60)
+    # 找 Google Ads Close
+    close_hit = _find_google_ads_close(page, 10)
+    if close_hit:
+        log(f"找到 Google Ads Close，已点击: {close_hit}")
+        _confirm_close_click(page, 10)
+    else:
+        log("Google Ads 层中未找到 Close，继续…")
+    page.wait_for_timeout(2500)
+    log("全站广告 modal 处理完成")
+    return True
 
 
 def _test_dump_final(page, tag: str = "TEST_FINAL"):
@@ -2511,6 +2612,9 @@ def run_server(cfg, server_id, account=""):
                     log(f"到达平台限制：{stop_reason}，停止续期")
                     log_quota(cur, prefix="当前")
                     break
+
+                # ── 处理全站广告 modal（会触发单条广告）──
+                _dismiss_unlock_modal(page)
 
                 # 点「延伸 / Extend」
                 log("正在寻找「续期/延伸」按钮…")
