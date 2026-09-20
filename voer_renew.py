@@ -65,6 +65,7 @@ from playwright.sync_api import sync_playwright
 
 MAX_DAILY_EXTENSIONS = 4
 MAX_SESSION_EXTENSIONS = 4
+_TEST_TIMEOUT = int(os.environ.get("AD_TEST_TIMEOUT", "0")) or 45
 
 RUNNING_STATUSES = {"running", "online"}
 STOPPED_STATUSES = {"stopped", "offline"}
@@ -82,6 +83,206 @@ STOPPING_STATUSES = {"stopping"}
 
 def log(*a):
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
+
+
+def _is_ad_frame(frame) -> bool:
+    """判断 frame 是否是广告 iframe（wormies / Google Ads）。"""
+    try:
+        u = (frame.url or "").lower()
+        return any(k in u for k in ("wormies", "googleads", "doubleclick", "googlesyndication"))
+    except Exception:
+        return False
+
+
+def _non_ad_frames(page) -> list:
+    """返回不包含广告 iframe 的 frame 列表（主面板）。"""
+    try:
+        return [f for f in page.frames if not _is_ad_frame(f)]
+    except Exception:
+        return []
+
+
+def _wormies_frames(page) -> list:
+    """返回 wormies/Voer 广告 frame（不含 Google Ads）。"""
+    try:
+        result = []
+        for f in page.frames:
+            try:
+                u = (f.url or "").lower()
+                if "wormies" in u or "voer-ads" in u:
+                    result.append(f)
+            except Exception:
+                pass
+        return result
+    except Exception:
+        return []
+
+
+def _wait_for_wormies_frame(page, timeout_sec: int = 60) -> list:
+    """等待 wormies/Voer 广告 frame 出现，返回 frame 列表；超时返回 []。
+
+    若检测到「Ad availability is low」提示，刷新页面后重试。
+    """
+    deadline = time.time() + timeout_sec
+    refresh_count = 0
+    max_refreshes = 3
+    while time.time() < deadline:
+        # 检测广告库存不足提示
+        if _check_ad_low_availability(page):
+            log(f"  [AD] 检测到「Ad availability is low」提示，刷新页面（第 {refresh_count + 1} 次）…")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(3000)
+                refresh_count += 1
+                if refresh_count >= max_refreshes:
+                    log("  [AD] 已刷新多次仍告库存不足，停止等待")
+                    return []
+                continue
+            except Exception as e:
+                log(f"  [AD] 刷新页面失败: {e}")
+                return []
+        frames = _get_wormies_frames(page)
+        if frames:
+            log(f"  [AD] Wormies frame 已出现: {[f.url for f in frames]}")
+            return frames
+        # 同时打印当前所有 frame URL 供诊断
+        try:
+            all_urls = [(f.url or "") for f in page.frames]
+            ad_urls = [u for u in all_urls if any(k in (u or "").lower() for k in ("wormies", "googleads", "doubleclick"))]
+            log(f"  [AD] 等待 Wormies frame… 当前广告帧={ad_urls}")
+        except Exception:
+            pass
+        time.sleep(3)
+    log("  [AD] 等待 Wormies frame 超时")
+    return []
+
+
+def _get_wormies_frames(page) -> list:
+    """与 _wormies_frames 相同，但用于内部调用以避免命名冲突。"""
+    return _wormies_frames(page)
+
+
+def _check_ad_low_availability(page) -> bool:
+    """检测是否出现「广告库存不足」提示。出现时应当刷新页面重试。"""
+    try:
+        src = page.content() or ""
+        low = src.lower()
+        return (
+            "ad availability is low" in low
+            or "广告库存不足" in low
+            or "广告额度不足" in low
+            or "your verified progress is safe" in low
+        )
+    except Exception:
+        return False
+
+
+def _log_wormies_elements(frame, tag: str = ""):
+    """打印 wormies frame 内所有可见元素的详细诊断信息。"""
+    log(f"  [{tag}] --- 开始诊断 ---")
+    try:
+        # 所有文本节点
+        texts = []
+        try:
+            all_texts = frame.locator("body").all_text_contents()
+            if isinstance(all_texts, str):
+                texts = [t.strip() for t in all_texts.split('\n') if t.strip()]
+            elif isinstance(all_texts, list):
+                for t in all_texts:
+                    s = (t or "").strip()
+                    if s and s not in texts:
+                        texts.append(s)
+        except Exception:
+            pass
+        log(f"  [{tag}] body 文本节点（前30个）: {texts[:30]}")
+        # 所有可见元素类型和文本
+        try:
+            els = frame.locator("*").all()
+            visible_types = {}
+            for el in els[:100]:
+                try:
+                    if el.is_visible():
+                        tag_name = el.evaluate("el => el.tagName").upper()
+                        text = (el.inner_text(timeout=500) or "").strip()
+                        key = f"{tag_name}('{text[:30]}')"
+                        if key not in visible_types:
+                            visible_types[key] = tag_name
+                except Exception:
+                    pass
+            log(f"  [{tag}] 可见元素类型分布: {list(visible_types.values())[:30]}")
+            log(f"  [{tag}] 可见非空元素示例: {[k for k in visible_types if 'Watch' in k or 'watch' in k or 'Close' in k or 'cancel' in k][:20]}")
+        except Exception as e:
+            log(f"  [{tag}] 元素扫描失败: {e}")
+    except Exception as e:
+        log(f"  [{tag}] 诊断异常: {e}")
+    log(f"  [{tag}] --- 诊断结束 ---")
+
+
+def click_in_frames(frames, texts, timeout_ms, exact=True):
+    """仅在指定 frame 列表中搜索并点击。也支持非 button/link 元素（通过 get_by_text）。"""
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        for frame in frames:
+            for t in texts:
+                makers = [
+                    lambda t=t, f=frame: f.get_by_role("button", name=t, exact=exact).first,
+                    lambda t=t, f=frame: f.get_by_role("link", name=t, exact=exact).first,
+                    lambda t=t, f=frame: f.get_by_text(t, exact=exact).first,
+                    lambda t=t, f=frame: f.locator(f"button:has-text('{t}')").first,
+                    lambda t=t, f=frame: f.locator(f"[role=button]:has-text('{t}')").first,
+                    lambda t=t, f=frame: f.locator(f"a:has-text('{t}')").first,
+                    lambda t=t, f=frame: f.locator(f"[title='{t}']").first,
+                    lambda t=t, f=frame: f.locator(f"text='{t}'").first,
+                ]
+                for maker in makers:
+                    try:
+                        loc = maker()
+                        if loc.count() and loc.is_visible():
+                            loc.click(timeout=3000)
+                            return f"{t}@{frame.url[:60]}"
+                    except Exception:
+                        pass
+        time.sleep(1.2)
+    return None
+
+
+def click_close_in_wormies(page, timeout_ms: int = 60000):
+    """仅在 wormies/Voer 广告 frame 中找 Close/×，不触碰 Google Ads iframe。
+
+    用于广告播放完成后的关闭操作。Google Ads iframe 里的 X/Close 可能是
+    广告自带控件，绝对不能在这里点击。
+    """
+    frames = _wormies_frames(page)
+    if not frames:
+        return None
+    return click_in_frames(
+        frames,
+        ["Close", "關閉", "关闭", "×", "X", "Done", "完成"],
+        timeout_ms,
+        exact=False,
+    )
+
+
+def _wait_for_ad_cleanup(page, timeout_sec: int = 30) -> bool:
+    """等待广告 iframe（wormies/googleads）从页面中移除，确认回到主面板。
+
+    返回 True 表示广告帧已清理/主面板已恢复；False 表示超时。
+    """
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            frames = list(page.frames)
+        except Exception:
+            break
+        if not any(_is_ad_frame(f) for f in frames):
+            log("  [AD] 广告 iframe 已全部卸载，主面板已恢复")
+            return True
+        # 打印当前仍存在的广告 frame 供诊断
+        ad_frames = [(f.url or "") for f in frames if _is_ad_frame(f)]
+        log(f"  [AD] 广告帧仍存在: {ad_frames}")
+        time.sleep(2)
+    log("  [AD] 等待广告帧清理超时，可能未正常关闭")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -488,15 +689,34 @@ def persist_token(cfg, new_token: str) -> None:
 
 
 def _sb_challenge_visible(sb) -> bool:
+    """判断当前是否存在尚未解决的 Cloudflare Turnstile Challenge。
+
+    不能仅凭 page_source 里有 "cf-turnstile" / "challenge-platform" 就判定为需要处理，
+    这些 JS/DOM 字符串在 Turnstile 通过后仍然存在于源码中。
+    只有出现明确需要用户交互的提示词（错误信息 / 未通过状态）才算 Challenge 可见。
+    """
     try:
         src = sb.get_page_source() or ""
         low = src.lower()
+        # 真正需要点击的 challenge 特征：
+        #   1. "verify you are human" / "security verification"：登录页 CF 盾的邀请文案
+        #   2. "challenge-platform"：实际渲染出的 challenge iframe 标记
+        # 以下关键词表示已安全/已通过，不应再处理：
+        #   - cf-mark-solved、cf-circle-checked、challenge-solved、security-check-passed
+        solved_keywords = [
+            "cf-mark-solved",
+            "cf-circle-checked",
+            "challenge-solved",
+            "security-check-passed",
+            "turnstile-success",
+            "cf-challenge-running/solved",
+        ]
+        if any(kw in low for kw in solved_keywords):
+            return False
         return (
             "verify you are human" in low
             or "security verification" in low
-            or "cf-turnstile" in low
             or "challenge-platform" in low
-            or "turnstile" in low and "cloudflare" in low
         )
     except Exception:
         return False
@@ -505,14 +725,9 @@ def _sb_challenge_visible(sb) -> bool:
 def _sb_handle_turnstile(sb, max_retry: int = 4) -> bool:
     """参考 SkyMC：SeleniumBase UC 点击 Cloudflare Turnstile。"""
     if not _sb_challenge_visible(sb):
-        # 即使不可见也尝试一次（有时 widget 已渲染）
-        try:
-            sb.uc_gui_click_captcha()
-            time.sleep(3)
-        except Exception:
-            pass
+        log("未检测到需要处理的 Cloudflare Challenge，跳过")
         return True
-    log("检测到 Cloudflare Turnstile，开始绕过…")
+    log("检测到 Cloudflare Challenge，开始处理")
     for i in range(max_retry):
         log(f"  Turnstile 第 {i + 1}/{max_retry} 次尝试")
         try:
@@ -520,7 +735,7 @@ def _sb_handle_turnstile(sb, max_retry: int = 4) -> bool:
             log("  已调用 uc_gui_click_captcha")
             time.sleep(5)
             if not _sb_challenge_visible(sb):
-                log("  Turnstile 已通过")
+                log("Cloudflare Challenge 已通过")
                 return True
         except Exception as e:
             log(f"  uc_gui_click_captcha 异常: {e}")
@@ -699,7 +914,7 @@ def login_with_password(cfg) -> str | None:
             for attempt in range(12):
                 time.sleep(2)
                 if _sb_challenge_visible(sb):
-                    log("登录后仍见 Turnstile，再次处理…")
+                    log("登录后仍见 Turnstile Challenge，再次处理…")
                     _sb_handle_turnstile(sb, max_retry=3)
                 url = (sb.get_current_url() or "").lower()
                 # 读 cookie
@@ -968,11 +1183,271 @@ def click_start_button(page) -> str | None:
     return hit
 
 
+def _dump_ad_state(page, tag: str = ""):
+    """采集广告流程关键节点的完整页面状态，供现场取证。"""
+    sep = f"----- 广告状态诊断 [{tag}] -----"
+    log(sep)
+    log(f"  page.url = {page.url!r}")
+    try:
+        log(f"  page.title = {page.title()!r}")
+    except Exception:
+        pass
+    try:
+        frames = list(page.frames)
+    except Exception:
+        frames = []
+    for idx, f in enumerate(frames):
+        try:
+            url = f.url or ""
+            title = f.title()
+            is_ad = _is_ad_frame(f)
+            # visible buttons
+            btns = []
+            try:
+                for role in ("button", "link"):
+                    try:
+                        for loc in f.get_by_role(role).all()[:30]:
+                            try:
+                                if loc.is_visible():
+                                    t = (loc.inner_text(timeout=500) or "").strip()
+                                    if t and t not in btns:
+                                        btns.append(t)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # keyword elements
+            kw_sels = [
+                "[class*='ad']", "[class*='Ad']", "[data-ad]",
+                "[role='button']", "button", "a",
+            ]
+            kw_elems = []
+            try:
+                for sel in kw_sels:
+                    try:
+                        for loc in f.locator(sel).all()[:20]:
+                            try:
+                                if loc.is_visible():
+                                    t = (loc.inner_text(timeout=500) or "").strip()
+                                    if t and t.lower() not in [x.lower() for x in kw_elems]:
+                                        kw_elems.append(t)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # video/audio
+            vid_cnt = 0
+            vid_info = []
+            try:
+                vids = f.locator("video").all()
+                vid_cnt = len(vids)
+                for v in vids[:3]:
+                    try:
+                        ci = v.evaluate("el => el.currentTime")
+                        du = v.evaluate("el => el.duration")
+                        pa = v.evaluate("el => el.paused")
+                        ed = v.evaluate("el => el.ended")
+                        src = v.evaluate("el => (el.src || '')")
+                        vid_info.append(f"currentTime={ci}s duration={du}s paused={pa} ended={ed} src={src[:80]}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            aud_cnt = 0
+            try:
+                auds = f.locator("audio").all()
+                aud_cnt = len(auds)
+            except Exception:
+                pass
+            log(f"  frame[{idx}] url={url!r} title={title!r} is_ad={is_ad} btns={btns[:15]} kw={kw_elems[:10]} video={vid_cnt} audio={aud_cnt}")
+            for vi in vid_info:
+                log(f"    video: {vi}")
+        except Exception as e:
+            log(f"  frame[{idx}] error: {e}")
+    log(f"  --- 诊断结束 [{tag}] ---")
+
+
+def _find_google_ads_close(page, timeout_sec: int) -> str | None:
+    """在 Google Ads 全屏层中查找并点击 Close / CLOSE 按钮。
+
+    只搜索含有 googleads / doubleclick / googlesyndication 的 frame，
+    只点击文本为 Close 或 CLOSE 的按钮（不点击 RESUME）。
+    返回描述字符串（如 "Close@https://googleads..."），超时返回 None。
+    """
+    deadline = time.time() + timeout_sec
+    elapsed = 0
+    while time.time() < deadline:
+        elapsed += 1
+        all_frames = []
+        try:
+            all_frames = list(page.frames)
+        except Exception:
+            pass
+        ga_frames = [f for f in all_frames if any(
+            k in (f.url or "").lower()
+            for k in ("googleads", "doubleclick", "googlesyndication")
+        )]
+        if not ga_frames:
+            log(f"  [TEST] {elapsed}/{timeout_sec}s Google Ads frame 未出现")
+            time.sleep(1)
+            continue
+        for ga_frame in ga_frames:
+            found = False
+            # 1) 标准 button/link role
+            for role in ("button", "link"):
+                try:
+                    for loc in ga_frame.get_by_role(role).all():
+                        try:
+                            if not loc.is_visible():
+                                continue
+                            t = (loc.inner_text(timeout=500) or "").strip()
+                            if t in ("Close", "CLOSE"):
+                                loc.click(timeout=3000)
+                                return f"{t}@{ga_frame.url[:80]}"
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            # 2) 文本匹配：所有可见元素
+            if not found:
+                try:
+                    for sel in ("[class*='close']", "[class*='Close']",
+                                "[data-close]", "[aria-label='Close']",
+                                "[aria-label='CLOSE']", "[title='Close']",
+                                "[title='CLOSE']", "div", "span", "a"):
+                        try:
+                            for loc in ga_frame.locator(sel).all():
+                                try:
+                                    if not loc.is_visible():
+                                        continue
+                                    t = (loc.inner_text(timeout=500) or "").strip()
+                                    if t in ("Close", "CLOSE"):
+                                        loc.click(timeout=3000)
+                                        return f"{t}@{ga_frame.url[:80]}"
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            # 3) get_by_text 兜底
+            if not found:
+                try:
+                    for t in ("Close", "CLOSE"):
+                        try:
+                            loc = ga_frame.get_by_text(t, exact=True).first
+                            if loc.count() and loc.is_visible():
+                                loc.click(timeout=3000)
+                                return f"{t}@{ga_frame.url[:80]}"
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        log(f"  [TEST] {elapsed}/{timeout_sec}s close_candidates=0，继续等待…")
+        time.sleep(1)
+    return None
+
+
+def _is_google_fullscreen_visible(page) -> bool:
+    """判断真正的 Google Ads 全屏广告层是否仍然可见。
+
+    核心依据：wormies frame 的实际 window.location.href 是否包含
+    #goog_fullscreen_ad。注意：frame.url 属性不含 hash，必须用 evaluate
+    读取完整 URL；不能靠 frame 是否存在来判断。
+    返回 True = 全屏广告层仍可见；False = 已关闭或根本不存在。
+    """
+    try:
+        all_frames = list(page.frames)
+    except Exception:
+        return False
+    for f in all_frames:
+        try:
+            url = (f.evaluate("location.href") or "").lower()
+            if "wormies" in url and "goog_fullscreen_ad" in url:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _confirm_close_click(page, timeout_sec: int) -> bool:
+    """点击 Close 后等待真正的全屏广告层消失。
+
+    使用 _is_google_fullscreen_visible 精确判断，不把普通 Google Ads
+    tracking iframe 误认为全屏广告层仍然存在。
+    返回 True 表示全屏层已清理；False 表示超时仍未关闭。
+    """
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if not _is_google_fullscreen_visible(page):
+            log("  [TEST] 全屏广告层已消失，Close 确认成功")
+            return True
+        try:
+            for f in list(page.frames):
+                url = (f.evaluate("location.href") or "").lower()
+                if "wormies" in url and "goog_fullscreen_ad" in url:
+                    log(f"  [TEST] fullscreen 仍可见: {url[:80]}")
+                    break
+            else:
+                # 所有 wormies frame 的 hash 都已清除，但检测还没触发
+                log("  [TEST] wormies frame hash 已清除，确认成功")
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    log("  [TEST] 等待全屏广告层消失超时")
+    return False
+
+
+def _test_dump_final(page, tag: str = "TEST_FINAL"):
+    """测试失败时的最终状态快照。"""
+    log(f"----- [TEST] 最终状态诊断 [{tag}] -----")
+    try:
+        log(f"  page.url = {page.url!r}")
+    except Exception:
+        pass
+    try:
+        frames = list(page.frames)
+    except Exception:
+        frames = []
+    for idx, f in enumerate(frames):
+        try:
+            url = f.url or ""
+            is_ad = any(k in url.lower() for k in ("wormies", "googleads", "doubleclick"))
+            btns = []
+            try:
+                for role in ("button", "link"):
+                    for loc in f.get_by_role(role).all()[:20]:
+                        try:
+                            if loc.is_visible():
+                                t = (loc.inner_text(timeout=500) or "").strip()
+                                if t and t not in btns:
+                                    btns.append(t)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            log(f"  frame[{idx}] is_ad={is_ad} btns={btns[:10]} url={url[:80]!r}")
+        except Exception:
+            pass
+    log(f"----- [TEST] 诊断结束 [{tag}] -----")
+
+
 def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
     """点击 Watch ad 并等待播放，返回实际完成的广告数。
 
-    与续期流程保持一致：进入广告页 → 循环点击 Watch ad → 等待播放 → Close。
-    若第一次点击后广告已在播放，则先等播完再 Close，计入第 1 条。
+    流程：
+      1. 进入广告流程（点击面板上的 Watch ad 入口）
+      2. 等待 wormies frame 出现（最长 120s）
+      3. 对每条广告：
+          - 若 wormies frame 有 Watch ad 按钮 → 点击开始播放
+          - 若已无 Watch ad 按钮（广告已开始）→ 等待帧消失
+          - 等待 wormies frame 卸载（确认广告完成）
+      4. 返回实际完成数
     """
     watch_labels = [
         "Watch ad",
@@ -985,9 +1460,7 @@ def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
         "开始",
         "開始",
     ]
-    close_labels = ["Close", "關閉", "关闭", "×", "X", "Done", "完成"]
     total = int(cfg.get("ads_per_extension") or 3)
-    ad_sec = int(cfg.get("ad_duration_sec") or 32)
     watched = 0
 
     page.wait_for_timeout(3000)
@@ -999,40 +1472,134 @@ def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
         log(f"{reason}: 已进入广告流程（{hit}）")
     else:
         log(f"{reason}: 未找到入口 Watch ad，尝试直接寻找可点广告按钮")
-    log(f"{reason}: 等待 Ad ready…")
-    page.wait_for_timeout(8000)
+
+    log(f"{reason}: 等待 Wormies frame 出现…")
+    wormies = _wait_for_wormies_frame(page, timeout_sec=120)
+    if not wormies:
+        log(f"{reason}: 等待 Wormies frame 超时，广告流程无法开始")
+        return watched
+
+    log(f"{reason}: 检测到 Wormies frame，开始逐条广告")
 
     for i in range(1, total + 1):
-        # 优先点 Watch ad；若点不到，可能上一条还在播，先尝试 Close 再重试
-        hit = click_anywhere(page, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 75000)
-        if not hit:
-            hit = click_anywhere(page, watch_labels, 20000, exact=False)
-        if not hit:
-            # 广告可能已自动开始播放：等待时长后关
-            log(f"{reason}: 第 {i} 个 Watch ad 未立刻出现，等待播放/关闭按钮…")
-            page.wait_for_timeout(ad_sec * 1000)
-            closed = click_anywhere(page, close_labels, 45000) or click_anywhere(
-                page, close_labels, 15000, exact=False
-            )
-            if closed:
-                watched += 1
-                log(f"{reason}: 第 {i}/{total} 个广告：已按播放完成关闭（{closed}）")
-                page.wait_for_timeout(5000)
+        # ── 进入当前广告前：确认 wormies frame 存在 ──
+        wormies = _get_wormies_frames(page)
+        if not wormies:
+            log(f"{reason}: 第 {i}/{total} 个广告前 Wormies frame 不存在，等待出现…")
+            wormies = _wait_for_wormies_frame(page, timeout_sec=60)
+            if not wormies:
+                log(f"{reason}: 第 {i} 个广告等待 Wormies frame 超时，停止")
+                break
+
+        # ── 在 wormies frame 里判断当前状态 ──
+        # 先检测 wormies frame 是否已经在播放广告（无需再点 Watch ad）
+        ad_playing = False
+        try:
+            body_text = wormies[0].locator("body").inner_text(timeout=5000)
+            if "Rewarded ad is playing" in body_text or "广告播放中" in body_text:
+                ad_playing = True
+                log(f"{reason}: 第 {i}/{total} 个广告：广告已在播放中，跳过点击")
+        except Exception:
+            pass
+
+        if not ad_playing:
+            # 在 wormies frame 里找 Watch ad 按钮
+            ad_hit = click_in_frames(wormies, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 15000)
+            if ad_hit:
+                log(f"[AD] 已点击第 {i}/{total} 个 Watch ad，click result={ad_hit}")
+                log(f"{reason}: 已点击第 {i}/{total} 个 Watch ad（{ad_hit}），播放中…")
+            else:
+                # 兜底：用 get_by_text 搜索
+                try:
+                    for t in ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"]:
+                        try:
+                            loc = wormies[0].get_by_text(t, exact=False).first
+                            if loc.count() and loc.is_visible():
+                                loc.click(timeout=3000)
+                                ad_hit = f"{t}@{wormies[0].url[:60]}"
+                                log(f"{reason}: 通过 get_by_text 找到并点击第 {i}/{total} 个 Watch ad: {ad_hit}")
+                                break
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                if not ad_hit:
+                    btns = []
+                    try:
+                        for role in ("button", "link"):
+                            try:
+                                for loc in wormies[0].get_by_role(role).all()[:20]:
+                                    try:
+                                        if loc.is_visible():
+                                            txt = (loc.inner_text(timeout=500) or "").strip()
+                                            if txt and txt not in btns:
+                                                btns.append(txt)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    log(f"{reason}: 第 {i} 个广告：Wormies frame 中未找到 Watch ad，可见按钮={btns}")
+
+            # ── 检测「Ad availability is low」错误 ──
+            if _check_ad_low_availability(page):
+                log(f"{reason}: 第 {i} 个广告检测到「Ad availability is low」，刷新重试…")
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(3000)
+                except Exception:
+                    pass
+                wormies = _wait_for_wormies_frame(page, timeout_sec=120)
+                if not wormies:
+                    log(f"{reason}: 刷新后仍无法进入广告，跳过本条")
+                    continue
+                # 重新检测播放状态
+                try:
+                    body_text = wormies[0].locator("body").inner_text(timeout=5000)
+                    if "Rewarded ad is playing" in body_text or "广告播放中" in body_text:
+                        ad_playing = True
+                        log(f"{reason}: 第 {i}/{total} 个广告：刷新后广告已在播放中")
+                except Exception:
+                    pass
+                if not ad_playing:
+                    ad_hit = click_in_frames(wormies, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 30000)
+                    if ad_hit:
+                        log(f"{reason}: 刷新后已点击第 {i}/{total} 个 Watch ad: {ad_hit}")
+                    else:
+                        log(f"{reason}: 第 {i} 个广告刷新后仍无 Watch ad，跳过")
+                        page.wait_for_timeout(2000)
+                        continue
+
+        # ── 检测「Ad availability is low」错误 ──
+        if _check_ad_low_availability(page):
+            log(f"{reason}: 第 {i} 个广告检测到「Ad availability is low」，刷新重试…")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(3000)
+            except Exception:
+                pass
+            wormies = _wait_for_wormies_frame(page, timeout_sec=120)
+            if not wormies:
+                log(f"{reason}: 刷新后仍无法进入广告，跳过本条")
                 continue
-            log(f"{reason}: 第 {i} 个 Watch ad 未找到，停止广告流程")
-            break
+
+        # ── 等待广告正常播放约 60 秒，不依赖 Wormies body 文本变化判断完成 ──
+        log(f"{reason}: 第 {i} 个广告：等待广告播放…")
+        time.sleep(60)
+        close_hit = _find_google_ads_close(page, 10)
+        if close_hit:
+            log(f"{reason}: 第 {i} 个广告：找到 Google Ads Close，已点击（{close_hit}）")
+            _confirm_close_click(page, 10)
+        else:
+            log(f"{reason}: 第 {i} 个广告：Google Ads 层中未找到 Close")
+        ad_done = True
 
         watched += 1
-        log(f"{reason}: 已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
-        page.wait_for_timeout(ad_sec * 1000)
-        closed = click_anywhere(page, close_labels, 60000) or click_anywhere(
-            page, close_labels, 15000, exact=False
-        )
-        log(
-            f"{reason}: 第 {i} 个广告:",
-            f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
-        )
-        page.wait_for_timeout(6000)
+        log(f"{reason}: 第 {i}/{total} 个广告已完成")
+
+        # 短暂停顿让页面稳定
+        page.wait_for_timeout(2000)
 
     log(f"{reason}: 广告流程结束，完成 {watched}/{total} 条")
     return watched
@@ -1051,6 +1618,97 @@ def restart_via_panel(cfg, page, reason: str = "关机后重启", server_id: str
         return 0
     log(f"{reason}: 已点击开机入口: {hit}")
     page.wait_for_timeout(2500)
+
+    # ── 临时测试模式：AD_TEST_MODE=first → 验证第一条广告完整流程（含 Google Ads Close）──
+    test_mode = os.environ.get("AD_TEST_MODE", "").strip().lower()
+    if test_mode == "first":
+        wormies = _wait_for_wormies_frame(page, timeout_sec=120)
+        if not wormies:
+            log("[TEST] 等待 Wormies frame 超时，测试失败")
+            return 0
+        log("[TEST] 已检测到 Wormies frame")
+        ad_hit = click_in_frames(wormies, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 30000)
+        if ad_hit:
+            log(f"[TEST] 已点击第 1 个 Watch ad: {ad_hit}")
+        else:
+            try:
+                for t in ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"]:
+                    try:
+                        loc = wormies[0].get_by_text(t, exact=False).first
+                        if loc.count() and loc.is_visible():
+                            loc.click(timeout=3000)
+                            log(f"[TEST] 通过 get_by_text 点击 Watch ad: {t}@{wormies[0].url[:60]}")
+                            break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        log("[TEST] Watch ad 已点击，等待 Google Ads Close…")
+        close_hit = _find_google_ads_close(page, _TEST_TIMEOUT)
+        if close_hit:
+            log(f"[TEST] 找到 Google Ads Close，已点击: {close_hit}")
+            ok = _confirm_close_click(page, _TEST_TIMEOUT)
+            if ok:
+                log("[TEST] 第一条广告完成，全屏层已消失，测试成功")
+            else:
+                log("[TEST] Close 已点击但全屏层未消失，测试失败")
+                raise RuntimeError("TEST_FAILED")
+        else:
+            log(f"[TEST] {_TEST_TIMEOUT}s 内未找到 Google Ads Close，测试失败")
+            raise RuntimeError("TEST_FAILED")
+        return 0  # 测试模式：提前退出，不触发 API 和状态等待
+
+    if test_mode == "first":
+        # 测试模式：不触发正式 API start，只跑广告流程
+        pass
+    elif test_mode == "all":
+        # ── AD_TEST_MODE=all：完整跑通 3 条广告流程（不含正式续期）──
+        total_ads = int(cfg.get("ads_per_extension") or 3)
+        log(f"[TEST] all 模式：将测试 {total_ads} 条广告完整流程")
+        for i in range(1, total_ads + 1):
+            log(f"[TEST] ========== 第 {i}/{total_ads} 条广告 ==========")
+            wormies = _wait_for_wormies_frame(page, timeout_sec=120)
+            if not wormies:
+                log(f"[TEST] 第 {i} 条广告：等待 Wormies frame 超时，测试失败")
+                raise RuntimeError("TEST_FAILED")
+            log(f"[TEST] 第 {i} 条广告：Wormies frame 已出现")
+            ad_hit = click_in_frames(wormies, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 30000)
+            if ad_hit:
+                log(f"[TEST] 第 {i} 条广告：已点击 Watch ad: {ad_hit}")
+            else:
+                try:
+                    for t in ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"]:
+                        try:
+                            loc = wormies[0].get_by_text(t, exact=False).first
+                            if loc.count() and loc.is_visible():
+                                loc.click(timeout=3000)
+                                ad_hit = f"{t}@{wormies[0].url[:60]}"
+                                log(f"[TEST] 第 {i} 条广告：通过 get_by_text 点击 Watch ad: {ad_hit}")
+                                break
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                if not ad_hit:
+                    log(f"[TEST] 第 {i} 条广告：未找到 Watch ad，测试失败")
+                    raise RuntimeError("TEST_FAILED")
+            log(f"[TEST] 第 {i} 条广告：等待 Google Ads Close…")
+            close_hit = _find_google_ads_close(page, _TEST_TIMEOUT)
+            if not close_hit:
+                log(f"[TEST] 第 {i} 条广告：{_TEST_TIMEOUT}s 内未找到 Google Ads Close，测试失败")
+                raise RuntimeError("TEST_FAILED")
+            log(f"[TEST] 第 {i} 条广告：找到并点击 Close: {close_hit}")
+            ok = _confirm_close_click(page, _TEST_TIMEOUT)
+            if not ok:
+                log(f"[TEST] 第 {i} 条广告：Close 后全屏层未消失，测试失败")
+                raise RuntimeError("TEST_FAILED")
+            log(f"[TEST] 第 {i}/{total_ads} 条广告完成 ✓")
+            page.wait_for_timeout(2000)
+        log(f"[TEST] {total_ads} 条广告全部完成，测试成功 ✓")
+        return 0  # 测试模式：提前退出，不触发 API 和状态等待
+    elif test_mode == "rounds":
+        log("[TEST] rounds 模式将在 run_server 广告循环里执行")
+
     watched = watch_rewarded_ads(cfg, page, reason=reason)
 
     # 广告看完后，用 adsCompleted 再请求一次开机（平台要求）
@@ -1128,6 +1786,11 @@ def ensure_running(cfg, server_id: str, page=None):
         elif need_ads:
             log("开机需要看广告，但当前没有浏览器会话，无法完成开机")
             return server, False
+
+    # ── 测试模式：跳过开机状态等待 ──
+    if os.environ.get("AD_TEST_MODE", "").strip().lower() in ("first", "all", "rounds"):
+        log(f"[TEST] 测试模式跳过状态等待，直接返回")
+        return server, True
 
     # 广告/指令后等待进入 running（缩短空等：若一直 stopped 则提前结束再重试）
     server = wait_for_status(cfg, server_id, RUNNING_STATUSES, timeout=180) or api_state(
@@ -1490,6 +2153,103 @@ def dump_page_debug(page, tag="debug"):
     log("----- 诊断结束 -----")
 
 
+def test_ad_flow(cfg, page, reason: str = "广告测试"):
+    """临时测试模式：验证广告入口和轮次切换，不修改正式逻辑。
+
+    AD_TEST_MODE=first   → 只测第 1 个广告入口（进入→等 wormies→点 Watch ad→退出）
+    AD_TEST_MODE=rounds  → 测完整 3 轮（每轮完成后重新等待新 wormies frame）
+    """
+    test_mode = os.environ.get("AD_TEST_MODE", "").strip().lower()
+    if test_mode not in ("first", "rounds"):
+        return True  # 非测试模式，正常继续
+
+    log(f"[TEST] AD_TEST_MODE={test_mode}，开始广告流程测试")
+
+    # 找并点击面板上的 Watch ad 入口
+    watch_labels = ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"]
+    hit = click_anywhere(page, watch_labels, 30000) or click_anywhere(
+        page, watch_labels, 15000, exact=False
+    )
+    if not hit:
+        log(f"[TEST] 未找到 Watch ad 入口，测试失败")
+        return False
+    log(f"[TEST] 已点击 Watch ad 入口: {hit}")
+
+    # 等待 Wormies frame 出现
+    wormies = _wait_for_wormies_frame(page, timeout_sec=120)
+    if not wormies:
+        log("[TEST] 等待 Wormies frame 超时，测试失败")
+        return False
+    log("[TEST] 已检测到 Wormies frame")
+
+    if test_mode == "first":
+        # 在 wormies frame 里找 Watch ad 并点击
+        ad_hit = click_in_frames(wormies, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 30000)
+        if ad_hit:
+            log(f"[TEST] 已找到并点击第 1 个 Watch ad: {ad_hit}")
+        else:
+            # 看 wormies frame 里有哪些按钮
+            btns = []
+            try:
+                for role in ("button", "link"):
+                    try:
+                        for loc in wormies[0].get_by_role(role).all()[:20]:
+                            try:
+                                if loc.is_visible():
+                                    t = (loc.inner_text(timeout=500) or "").strip()
+                                    if t and t not in btns:
+                                        btns.append(t)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            log(f"[TEST] Watch ad 未找到，wormies frame 可见按钮={btns}")
+            log("[TEST] 第一条广告入口测试完成（Watch ad 未出现，可能已自动开始）")
+        log("[TEST] 第一条广告入口测试成功，停止测试")
+        return True
+
+    # ── rounds 模式：循环 3 条广告，验证每轮 wormies frame 重新出现 ──
+    for i in range(1, 4):
+        # 等待 wormies frame
+        wormies = _get_wormies_frames(page)
+        if not wormies:
+            log(f"[TEST] 第 {i}/3 条广告前：等待新的 Wormies frame…")
+            wormies = _wait_for_wormies_frame(page, timeout_sec=60)
+            if not wormies:
+                log(f"[TEST] 第 {i}/3 条广告等待 Wormies frame 超时，测试停止")
+                break
+        log(f"[TEST] 第 {i}/3 条：Wormies frame 已就绪")
+
+        # 在 wormies frame 里找 Watch ad
+        ad_hit = click_in_frames(wormies, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 30000)
+        if ad_hit:
+            log(f"[TEST] 第 {i}/3 条：已点击 Watch ad: {ad_hit}")
+        else:
+            log(f"[TEST] 第 {i}/3 条：Wormies frame 中未找到 Watch ad（可能已开始）")
+
+        # 等待 wormies frame 卸载（广告完成）
+        log(f"[TEST] 第 {i}/3 条：等待 Wormies frame 卸载…")
+        end = time.time() + 180
+        gone = False
+        while time.time() < end:
+            if not _get_wormies_frames(page):
+                gone = True
+                log(f"[TEST] 第 {i}/3 条：Wormies frame 已卸载，广告完成")
+                break
+            time.sleep(3)
+        if not gone:
+            log(f"[TEST] 第 {i}/3 条：等待 wormies frame 卸载超时")
+            break
+
+        # 短暂停顿后进入下一轮（frame 消失后会自动重新出现）
+        page.wait_for_timeout(3000)
+
+    log("[TEST] 广告轮次切换测试完成")
+    return True
+
+
 def run_server(cfg, server_id, account=""):
     """对单台服务器执行一次完整续期流程。返回 True=成功，False/抛异常=失败，None=跳过。"""
     url = f"https://voer.host/panel/server/{server_id}"
@@ -1579,6 +2339,7 @@ def run_server(cfg, server_id, account=""):
     max_ext = max(1, int(cfg.get("extensions_per_run", 4)))
     rounds_ok = 0
     stop_reason = ""
+    reason = "续期"
 
     watch_labels = [
         "觀看廣告",
@@ -1662,6 +2423,12 @@ def run_server(cfg, server_id, account=""):
 
             # 只检查是否关机：关机则开机/重启（不抛错）
             before, did_power = ensure_running(cfg, server_id, page=page)
+
+            # ── 测试模式：确保运行后直接退出，不走后续续期流程 ──
+            if os.environ.get("AD_TEST_MODE", "").strip().lower() in ("first", "all", "rounds"):
+                log("[TEST] 测试模式：跳过后续续期流程，正常退出")
+                return True
+
             if did_power:
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=60000)
@@ -1795,24 +2562,120 @@ def run_server(cfg, server_id, account=""):
                     else:
                         log(f"已点击观看广告: {hit2}")
                 log("已打开广告流程，等待 Ad ready…")
-                page.wait_for_timeout(8000)
+                page.wait_for_timeout(3000)
+
+                # ── 临时测试模式：在广告流程入口处拦截（仅 rounds 模式）──
+                if os.environ.get("AD_TEST_MODE", "").strip().lower() == "rounds":
+                    test_ad_flow(cfg, page, reason="关机后开机")
+                    log("[TEST] 测试模式结束，正常退出")
+                    return True
 
                 total = int(cfg["ads_per_extension"])
-                for i in range(1, total + 1):
-                    hit = click_anywhere(
-                        page, ["Watch ad", "觀看廣告", "观看广告"], 75000
-                    )
-                    if not hit:
-                        log(f"第 {i} 个 Watch ad 未找到，停止")
-                        break
-                    log(f"已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
-                    page.wait_for_timeout(int(cfg["ad_duration_sec"]) * 1000)
-                    closed = click_anywhere(page, ["Close", "關閉", "关闭"], 60000)
-                    log(
-                        f"第 {i} 个广告:",
-                        f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
-                    )
-                    page.wait_for_timeout(6000)
+                # 记住本轮开始时的主面板 URL，用于校验是否成功回到主面板
+                main_url_at_start = page.url
+                log(f"{reason}: 等待 Wormies frame 出现…")
+                wormies = _wait_for_wormies_frame(page, timeout_sec=120)
+                if not wormies:
+                    log(f"{reason}: 等待 Wormies frame 超时，无法进入广告流程")
+                else:
+                    for i in range(1, total + 1):
+                        # 进入每条广告前：确认 wormies frame 存在
+                        wormies = _get_wormies_frames(page)
+                        if not wormies:
+                            log(f"[AD] 第 {i}/{total} 个广告前等待 Wormies frame…")
+                            wormies = _wait_for_wormies_frame(page, timeout_sec=60)
+                            if not wormies:
+                                log(f"[AD] 第 {i} 个广告等待 Wormies frame 超时，停止")
+                                break
+                        # ── 在 wormies frame 里判断当前状态 ──
+                        # 先检测是否已在播放广告
+                        ad_playing = False
+                        try:
+                            body_text = wormies[0].locator("body").inner_text(timeout=5000)
+                            if "Rewarded ad is playing" in body_text or "广告播放中" in body_text:
+                                ad_playing = True
+                                log(f"[AD] 第 {i}/{total} 个广告：广告已在播放中，跳过点击")
+                        except Exception:
+                            pass
+
+                        if not ad_playing:
+                            # 在 wormies frame 里找 Watch ad
+                            ad_hit = click_in_frames(wormies, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 15000)
+                            if ad_hit:
+                                log(f"[AD] 已点击第 {i}/{total} 个 Watch ad，click result={ad_hit}")
+                                log(f"已点击第 {i}/{total} 个 Watch ad（{ad_hit}），播放中…")
+                            else:
+                                # 兜底：用 get_by_text 搜索
+                                try:
+                                    for t in ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"]:
+                                        try:
+                                            loc = wormies[0].get_by_text(t, exact=False).first
+                                            if loc.count() and loc.is_visible():
+                                                loc.click(timeout=3000)
+                                                ad_hit = f"{t}@{wormies[0].url[:60]}"
+                                                log(f"[AD] 通过 get_by_text 点击第 {i}/{total} 个 Watch ad: {ad_hit}")
+                                                break
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                                if not ad_hit:
+                                    btns = []
+                                    try:
+                                        for role in ("button", "link"):
+                                            try:
+                                                for loc in wormies[0].get_by_role(role).all()[:20]:
+                                                    try:
+                                                        if loc.is_visible():
+                                                            txt = (loc.inner_text(timeout=500) or "").strip()
+                                                            if txt and txt not in btns:
+                                                                btns.append(txt)
+                                                    except Exception:
+                                                        pass
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+                                    log(f"第 {i} 个广告：Wormies frame 中未找到 Watch ad，可见按钮={btns}")
+
+                            # ── 检测「Ad availability is low」错误 ──
+                            if _check_ad_low_availability(page):
+                                log(f"[AD] 第 {i} 个广告检测到「Ad availability is low」，刷新页面重试…")
+                                try:
+                                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                                    page.wait_for_timeout(3000)
+                                except Exception:
+                                    pass
+                                wormies = _wait_for_wormies_frame(page, timeout_sec=60)
+                                if not wormies:
+                                    log(f"[AD] 刷新后仍无法进入广告流程，停止")
+                                    break
+                                # 重新检测播放状态
+                                try:
+                                    body_text = wormies[0].locator("body").inner_text(timeout=5000)
+                                    if "Rewarded ad is playing" in body_text or "广告播放中" in body_text:
+                                        ad_playing = True
+                                        log(f"[AD] 刷新后广告已在播放中")
+                                except Exception:
+                                    pass
+                                if not ad_playing:
+                                    ad_hit = click_in_frames(wormies, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 15000)
+                                    if not ad_hit:
+                                        log(f"[AD] 第 {i} 个广告刷新后仍无 Watch ad，跳过本轮")
+                                        page.wait_for_timeout(2000)
+                                        continue
+                                    log(f"[AD] 刷新后重新点击第 {i} 个 Watch ad: {ad_hit}")
+                        # ── 等待广告正常播放约 60 秒，不依赖 Wormies body 文本变化判断完成 ──
+                        log(f"[AD] 第 {i} 个广告：等待广告播放…")
+                        time.sleep(60)
+                        close_hit = _find_google_ads_close(page, 10)
+                        if close_hit:
+                            log(f"[AD] 第 {i} 个广告：找到 Google Ads Close，已点击（{close_hit}）")
+                            _confirm_close_click(page, 10)
+                        else:
+                            log(f"[AD] 第 {i} 个广告：Google Ads 层中未找到 Close")
+                        ad_done = True
+                        page.wait_for_timeout(2000)
 
                 # 等待本轮 +4h 生效
                 end = time.time() + 180
