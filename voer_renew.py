@@ -27,6 +27,7 @@ VPS / CI 无图形界面时必须用虚拟显示：
 """
 import json
 import os
+import uuid
 import sys
 import time
 import pathlib
@@ -923,9 +924,9 @@ def is_starting(server) -> bool:
     return server_status_key(server) in STARTING_STATUSES
 
 
-def api_post(cfg, path: str, payload=None, timeout: int = 60):
-    """POST voer.host API。返回 (status_code, body_dict)。失败不 sys.exit。"""
-    url = path if path.startswith("http") else f"https://voer.host{path}"
+def api_post(cfg, path: str, payload=None, timeout: int = 60, base_url: str = "https://voer.host"):
+    """POST voer API。返回 (status_code, body_dict)。失败不 sys.exit。"""
+    url = path if path.startswith("http") else f"{base_url}{path}"
     body = json.dumps(payload if payload is not None else {}).encode()
     req = urllib.request.Request(
         url,
@@ -962,6 +963,62 @@ def api_post(cfg, path: str, payload=None, timeout: int = 60):
     except Exception as e:
         log(f"API POST 异常 {url}: {e}")
         return 0, {"error": str(e)}
+
+
+def ad_start_prepare(cfg, server_id: str, flow_id: str) -> tuple:
+    """POST /api/servers/{id}/ad-start-prepare。返回 (code, data)，data 含 batchRequestId。"""
+    return api_post(cfg, f"/api/servers/{server_id}/ad-start-prepare", {"flowId": flow_id})
+
+
+def ad_start_nonces(cfg, server_id: str, flow_id: str, count: int = 1) -> tuple:
+    """POST /api/servers/{id}/ad-start-nonces。"""
+    return api_post(cfg, f"/api/servers/{server_id}/ad-start-nonces", {"flowId": flow_id, "count": count})
+
+
+def _get_user_id(cfg) -> str:
+    """从 /api/auth/me 获取当前用户 ID。"""
+    code, data = api_post(cfg, "/api/auth/me", timeout=30)
+    if code == 200 and isinstance(data, dict):
+        user = data.get("user") or {}
+        return str(user.get("id") or user.get("userId") or "")
+    return ""
+
+
+def _generate_request_id(batch_request_id: str, ad_index: int, attempt: int) -> str:
+    """生成 requestId。规则：batchRequestId:adIndex:attempt。"""
+    return f"{batch_request_id}:{ad_index}:{attempt}"
+
+
+def verify_ad_arm(cfg, server_id: str, flow_id: str, nonce: str, user_id: str, request_id: str) -> tuple:
+    """POST https://wormies.voer.host/api/ads/ssv/arm。"""
+    if not user_id:
+        user_id = _get_user_id(cfg)
+    payload = {
+        "nonce": nonce,
+        "requestId": request_id,
+        "context": {
+            "userId": user_id,
+            "serverId": server_id,
+            "flowId": flow_id,
+        },
+    }
+    return api_post(cfg, "/api/ads/ssv/arm", payload, timeout=60, base_url="https://wormies.voer.host")
+
+
+def verify_ad_reward(cfg, server_id: str, flow_id: str, nonce: str, request_id: str, user_id: str) -> tuple:
+    """POST https://wormies.voer.host/api/ads/ssv/reward。"""
+    if not user_id:
+        user_id = _get_user_id(cfg)
+    payload = {
+        "nonce": nonce,
+        "requestId": request_id,
+        "context": {
+            "userId": user_id,
+            "serverId": server_id,
+            "flowId": flow_id,
+        },
+    }
+    return api_post(cfg, "/api/ads/ssv/reward", payload, timeout=60, base_url="https://wormies.voer.host")
 
 
 def api_power(cfg, server_id: str, action: str, extra=None):
@@ -1369,7 +1426,7 @@ def click_start_button(page) -> str | None:
     return hit
 
 
-def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
+def watch_rewarded_ads(cfg, page, server_id: str, reason: str = "开机/续期") -> int:
     """点击 Watch ad 并等待播放，返回实际完成的广告数。
 
     与续期流程保持一致：进入广告页 → 循环点击 Watch ad → 等待播放 → Close。
@@ -1393,62 +1450,132 @@ def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
         "Watch Ads",
     ]
     close_labels = AD_CLOSE_LABELS
-    total = int(cfg.get("ads_per_extension") or 3)
     ad_sec = int(cfg.get("ad_duration_sec") or 32)
     watched = 0
 
+    # 使用新 API 流程：ad-start-prepare → ad-start-nonces → arm → watch → close → reward
+    # 准备广告流程，获取 flowId 和广告进度
+    flow_id = str(uuid.uuid4())
+    code, data = ad_start_prepare(cfg, server_id, flow_id)
+    if code not in (200, 201, 202, 204):
+        log(f"{reason}: ad-start-prepare 失败 HTTP {code}，回退旧流程")
+        # 回退到旧流程
+        page.wait_for_timeout(3000)
+        hit = click_anywhere(page, watch_labels, 30000) or click_anywhere(
+            page, watch_labels, 15000, exact=False
+        )
+        if not hit:
+            log(f"{reason}: 未找到入口 Watch ad，尝试直接寻找可点广告按钮")
+        log(f"{reason}: 等待 Ad ready…")
+        page.wait_for_timeout(8000)
+        total = int(cfg.get("ads_per_extension") or 3)
+        for i in range(1, total + 1):
+            hit = click_anywhere(page, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 75000)
+            if not hit:
+                hit = click_anywhere(page, watch_labels, 20000, exact=False)
+            if not hit:
+                log(f"{reason}: 第 {i} 个 Watch ad 未立刻出现，等待播放/关闭按钮…")
+                page.wait_for_timeout(ad_sec * 1000)
+                closed = click_anywhere(page, close_labels, 45000) or click_anywhere(
+                    page, close_labels, 15000, exact=False
+                )
+                if closed:
+                    watched += 1
+                    log(f"{reason}: 第 {i}/{total} 个广告：已按播放完成关闭（{closed}）")
+                    page.wait_for_timeout(5000)
+                    continue
+                log(f"{reason}: 第 {i} 个 Watch ad 未找到，停止广告流程")
+                break
+
+            watched += 1
+            log(f"{reason}: 已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
+            page.wait_for_timeout(ad_sec * 1000)
+            closed = click_anywhere(page, close_labels, 60000) or click_anywhere(
+                page, close_labels, 15000, exact=False
+            )
+            log(
+                f"{reason}: 第 {i} 个广告:",
+                f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
+            )
+            page.wait_for_timeout(6000)
+
+        log(f"{reason}: 广告流程结束，完成 {watched}/{total} 条")
+        return watched
+
+    log(f"{reason}: ad-start-prepare 成功: flowId={flow_id}")
+    batch_request_id = data.get("batchRequestId", "")
+    completed_ads = data.get("completedAds", 0)
+    ads_required = data.get("adsRequired", 3)
+    log(f"{reason}: 广告进度: {completed_ads}/{ads_required}")
+
+    # 获取 nonce 列表
+    code, data = ad_start_nonces(cfg, server_id, flow_id, count=1)
+    if code not in (200, 201, 202, 204):
+        log(f"{reason}: ad-start-nonces 失败 HTTP {code}，回退旧流程")
+        return watched
+
+    nonces = data.get("ssvNonces", [])
+    if not nonces:
+        log(f"{reason}: 未获取到 nonce，回退旧流程")
+        return watched
+
+    if not batch_request_id:
+        log(f"{reason}: 未获取到 batchRequestId，回退旧流程")
+        return watched
+    nonce = nonces[0] if nonces else ""
+    user_id = _get_user_id(cfg)
+
+    # 点击 Watch ad 进入广告播放
     page.wait_for_timeout(3000)
-    # 进入广告流程
     hit = click_anywhere(page, watch_labels, 30000) or click_anywhere(
         page, watch_labels, 15000, exact=False
     )
-    if hit:
-        log(f"{reason}: 已进入广告流程（{hit}）")
-    else:
+    if not hit:
         log(f"{reason}: 未找到入口 Watch ad，尝试直接寻找可点广告按钮")
     log(f"{reason}: 等待 Ad ready…")
     page.wait_for_timeout(8000)
 
-    for i in range(1, total + 1):
-        # 优先点 Watch ad；若点不到，可能上一条还在播，先尝试 Close 再重试
-        hit = click_anywhere(page, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 75000)
-        if not hit:
-            hit = click_anywhere(page, watch_labels, 20000, exact=False)
-        if not hit:
-            # 广告可能已自动开始播放：等待时长后关
-            log(f"{reason}: 第 {i} 个 Watch ad 未立刻出现，等待播放/关闭按钮…")
-            page.wait_for_timeout(ad_sec * 1000)
-            closed = click_anywhere(page, close_labels, 45000) or click_anywhere(
-                page, close_labels, 15000, exact=False
-            )
-            if closed:
-                watched += 1
-                log(f"{reason}: 第 {i}/{total} 个广告：已按播放完成关闭（{closed}）")
-                page.wait_for_timeout(5000)
-                continue
-            log(f"{reason}: 第 {i} 个 Watch ad 未找到，停止广告流程")
+    # 循环播放剩余广告
+    for ad_index in range(completed_ads + 1, ads_required + 1):
+        if not nonces or (ad_index - 1) >= len(nonces):
+            log(f"{reason}: 第 {ad_index} 个广告: 未获取到 nonce")
             break
 
-        watched += 1
-        log(f"{reason}: 已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
+        nonce = nonces[ad_index - 1]
+        attempt = 1  # 第一次尝试
+        request_id = _generate_request_id(batch_request_id, ad_index, attempt)
+
+        log(f"{reason}: 第 {ad_index}/{ads_required} 个广告: 调用 arm (requestId={request_id})")
+        arm_code, _ = verify_ad_arm(cfg, server_id, flow_id, nonce, user_id, request_id)
+        if arm_code not in (200, 201, 202, 204):
+            log(f"{reason}: 第 {ad_index} 个广告: arm 失败 HTTP {arm_code}")
+
+        log(f"{reason}: 第 {ad_index} 个广告: 播放中…")
         page.wait_for_timeout(ad_sec * 1000)
+
         closed = click_anywhere(page, close_labels, 60000) or click_anywhere(
             page, close_labels, 15000, exact=False
         )
-        log(
-            f"{reason}: 第 {i} 个广告:",
-            f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
-        )
-        page.wait_for_timeout(6000)
+        if not closed:
+            log(f"{reason}: 第 {ad_index} 个广告: 未找到 Close 按钮")
 
-    log(f"{reason}: 广告流程结束，完成 {watched}/{total} 条")
+        log(f"{reason}: 第 {ad_index} 个广告: 调用 reward (requestId={request_id})")
+        reward_code, _ = verify_ad_reward(cfg, server_id, flow_id, nonce, request_id, user_id)
+        if reward_code not in (200, 201, 202, 204):
+            log(f"{reason}: 第 {ad_index} 个广告: reward 失败 HTTP {reward_code}")
+
+        watched += 1
+        log(f"{reason}: 第 {ad_index}/{ads_required} 个广告: 完成")
+        page.wait_for_timeout(5000)
+
+    log(f"{reason}: 广告流程结束，完成 {watched} 条")
     return watched
 
 
 def restart_via_panel(cfg, page, reason: str = "关机后重启", server_id: str | None = None) -> int:
     """在面板点击 Start/开机并看激励广告。
 
-    返回完成的广告数。若传入 server_id，广告结束后会带 adsCompleted 再调一次 start API。
+    返回完成的广告数。广告完成后后端自动启动服务器，不再调用 /start API。
     """
     if page is None:
         return 0
@@ -1458,24 +1585,10 @@ def restart_via_panel(cfg, page, reason: str = "关机后重启", server_id: str
         return 0
     log(f"{reason}: 已点击开机入口: {hit}")
     page.wait_for_timeout(2500)
-    watched = watch_rewarded_ads(cfg, page, reason=reason)
+    watched = watch_rewarded_ads(cfg, page, server_id or "", reason=reason)
 
-    # 广告看完后，用 adsCompleted 再请求一次开机（平台要求）
-    if server_id:
-        n = max(watched, int(cfg.get("ads_per_extension") or 3))
-        for ads_n in (n, 3, 2, 1):
-            log(f"{reason}: 广告后再次 API start（adsCompleted={ads_n}）")
-            code, data = api_power(cfg, server_id, "start", {"adsCompleted": ads_n})
-            if code in (200, 201, 202, 204):
-                log(f"{reason}: API start 已接受（adsCompleted={ads_n}）")
-                break
-            if not ads_required_error(code, data):
-                # 非广告错误，再试 restart
-                code2, _ = api_power(cfg, server_id, "restart")
-                if code2 in (200, 201, 202, 204):
-                    log(f"{reason}: API restart 已接受")
-                    break
-            page.wait_for_timeout(1500)
+    # 广告完成后后端自动启动，不再调用 /start API
+    log(f"{reason}: 广告已完成，后端将自动启动服务器")
     return watched
 
 
@@ -1537,12 +1650,11 @@ def ensure_running(cfg, server_id: str, page=None):
         return server, False, "start_failed"
 
     log("检测到关机/离线：执行开机或重启")
-    own_action_accepted = False  # 脚本自身的开机动作是否被平台接受（API 2xx / 状态实际离开 stopped）
+    own_action_accepted = False
     need_ads = False
     for act in ("start", "restart"):
         log(f"发送电源指令: {act}")
-        extra = {"adsCompleted": 0} if act == "start" else {}
-        code, data = api_power(cfg, server_id, act, extra)
+        code, data = api_power(cfg, server_id, act)
         if code in (200, 201, 202, 204):
             own_action_accepted = True
             if isinstance(data, dict) and data.get("server"):
