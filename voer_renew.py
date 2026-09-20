@@ -27,7 +27,6 @@ VPS / CI 无图形界面时必须用虚拟显示：
 """
 import json
 import os
-import uuid
 import sys
 import time
 import pathlib
@@ -79,54 +78,6 @@ STARTING_STATUSES = {
     "migrating",
 }
 STOPPING_STATUSES = {"stopping"}
-
-# ---------------------------------------------------------------------------
-# 网站访问解锁弹窗（登录后偶现）：独立标签集，与开机广告 / Extend 续期 3 广告完全隔离。
-# 该广告只是「网站级 24h 访问解锁」，绝不计入任何 adsCompleted / 广告计数。
-# 检测文案来自实际页面确认的中英文原文，仅使用完整、明确的文案，
-# 不加入 Watch/View/Ad/Unlock/Continue 等泛化词。
-SITE_UNLOCK_DETECT = [
-    "解锁更多内容",
-    "请做出选择以便继续访问此网站上的内容",
-    "获得 24 小时的网站级访问权限",
-    "Unlock more content",
-    "Take action to continue accessing the content on this site",
-    "View a short ad",
-    "Site-wide access for 24 hours",
-]
-SITE_UNLOCK_CLICK = [
-    "观看一则短广告",
-    "View a short ad",
-]
-
-# ---------------------------------------------------------------------------
-# 「区域不可用」提示检测（API 主检测 + UI 辅助检测；命中后优先自动换区，无候选才终止）。
-# UI 文案来自 Voer 前端 bundle（ServerDetail 组件）确认的原文，仅作辅助检测；
-# 主检测为 API 字段（见 _api_region_unavailable）。绝不用于 UI 点击区域按钮。
-REGION_SHORTAGE_DETECT = [
-    "Region unavailable",
-    "No providers are currently available in this region",
-    "No providers are currently available in the selected region.",
-    "No other regions currently have capacity",
-]
-
-# 广告播放结束后的手动关闭按钮（网站解锁 / 开机 / 续期广告共用同一套，不重复定义）。
-# 注意：绝对不要把 "Close ad gate"（关闭整个广告门、会中止 Start 流程）加入此列表。
-AD_CLOSE_LABELS = [
-    "Close",
-    "關閉",
-    "关闭",
-    "×",
-    "X",
-    "Done",
-    "完成",
-]
-
-# live.regionUnavailable / regionCapacityLow 的有效期窗口（与前端 ct() 的 300 秒窗口一致）
-REGION_UNAVAILABLE_WINDOW_SEC = 300
-
-# 单次运行内最大自动换区次数（仅防止无限循环，不是区域优先级）
-MAX_REGION_SWITCHES = 3
 
 
 def log(*a):
@@ -924,23 +875,20 @@ def is_starting(server) -> bool:
     return server_status_key(server) in STARTING_STATUSES
 
 
-def api_post(cfg, path: str, payload=None, timeout: int = 60, base_url: str = "https://voer.host", extra_headers: dict | None = None):
-    """POST voer API。返回 (status_code, body_dict)。失败不 sys.exit。"""
-    url = path if path.startswith("http") else f"{base_url}{path}"
+def api_post(cfg, path: str, payload=None, timeout: int = 60):
+    """POST voer.host API。返回 (status_code, body_dict)。失败不 sys.exit。"""
+    url = path if path.startswith("http") else f"https://voer.host{path}"
     body = json.dumps(payload if payload is not None else {}).encode()
-    headers = {
-        "Cookie": f"token={cfg['token']}",
-        "Authorization": f"Bearer {cfg['token']}",
-        "User-Agent": UA,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    if extra_headers:
-        headers.update(extra_headers)
     req = urllib.request.Request(
         url,
         data=body,
-        headers=headers,
+        headers={
+            "Cookie": f"token={cfg['token']}",
+            "Authorization": f"Bearer {cfg['token']}",
+            "User-Agent": UA,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
         method="POST",
     )
     try:
@@ -966,70 +914,6 @@ def api_post(cfg, path: str, payload=None, timeout: int = 60, base_url: str = "h
     except Exception as e:
         log(f"API POST 异常 {url}: {e}")
         return 0, {"error": str(e)}
-
-
-def ad_start_prepare(cfg, server_id: str, flow_id: str) -> tuple:
-    """POST /api/servers/{id}/ad-start-prepare。返回 (code, data)，data 含 batchRequestId。"""
-    return api_post(cfg, f"/api/servers/{server_id}/ad-start-prepare", {"flowId": flow_id})
-
-
-def ad_start_nonces(cfg, server_id: str, flow_id: str, count: int = 1) -> tuple:
-    """POST /api/servers/{id}/ad-start-nonces。"""
-    return api_post(
-        cfg,
-        f"/api/servers/{server_id}/ad-start-nonces",
-        {"flowId": flow_id, "count": count},
-        extra_headers={
-            "Origin": "https://voer.host",
-            "Referer": f"https://voer.host/panel/server/{server_id}",
-        },
-    )
-
-
-def _get_user_id(cfg) -> str:
-    """从 /api/auth/me 获取当前用户 ID。"""
-    code, data = api_post(cfg, "/api/auth/me", timeout=30)
-    if code == 200 and isinstance(data, dict):
-        user = data.get("user") or {}
-        return str(user.get("id") or user.get("userId") or "")
-    return ""
-
-
-def _generate_request_id(batch_request_id: str, ad_index: int, attempt: int) -> str:
-    """生成 requestId。规则：batchRequestId:adIndex:attempt。"""
-    return f"{batch_request_id}:{ad_index}:{attempt}"
-
-
-def verify_ad_arm(cfg, server_id: str, flow_id: str, nonce: str, user_id: str, request_id: str) -> tuple:
-    """POST https://wormies.voer.host/api/ads/ssv/arm。"""
-    if not user_id:
-        user_id = _get_user_id(cfg)
-    payload = {
-        "nonce": nonce,
-        "requestId": request_id,
-        "context": {
-            "userId": user_id,
-            "serverId": server_id,
-            "flowId": flow_id,
-        },
-    }
-    return api_post(cfg, "/api/ads/ssv/arm", payload, timeout=60, base_url="https://wormies.voer.host")
-
-
-def verify_ad_reward(cfg, server_id: str, flow_id: str, nonce: str, request_id: str, user_id: str) -> tuple:
-    """POST https://wormies.voer.host/api/ads/ssv/reward。"""
-    if not user_id:
-        user_id = _get_user_id(cfg)
-    payload = {
-        "nonce": nonce,
-        "requestId": request_id,
-        "context": {
-            "userId": user_id,
-            "serverId": server_id,
-            "flowId": flow_id,
-        },
-    }
-    return api_post(cfg, "/api/ads/ssv/reward", payload, timeout=60, base_url="https://wormies.voer.host")
 
 
 def api_power(cfg, server_id: str, action: str, extra=None):
@@ -1066,360 +950,7 @@ def wait_for_status(cfg, server_id: str, want, timeout: int = 300, poll: float =
     return last
 
 
-def _text_visible_anywhere(page, texts, exact: bool = True):
-    """跨主页面与所有 iframe 检测某组文本是否可见（只检测，绝不点击）。
-
-    返回命中的第一条文本；未命中返回 None；页面不可用时返回 None。
-    """
-    try:
-        frames = list(page.frames)
-    except Exception:
-        return None
-    for frame in frames:
-        for t in texts:
-            try:
-                loc = frame.get_by_text(t, exact=exact).first
-                if loc.count() and loc.is_visible():
-                    return t
-            except Exception:
-                continue
-    return None
-
-
-def _site_unlock_present(page):
-    """是否仍显示「网站访问解锁」提示。返回命中文本，未出现返回 None。"""
-    hit = _text_visible_anywhere(page, SITE_UNLOCK_DETECT, exact=True)
-    if hit:
-        return hit
-    return _text_visible_anywhere(page, SITE_UNLOCK_DETECT, exact=False)
-
-
-def ensure_site_unlock(cfg, page) -> bool:
-    """处理登录后偶现的「网站访问解锁」弹窗（独立流程）。
-
-    页面可能显示：解锁更多内容 / 请做出选择以便继续访问此网站上的内容 /
-    观看一则短广告 / 获得 24 小时的网站级访问权限。
-
-    这是「网站级 24h 访问解锁」广告，与开机广告、Extend 续期 3 广告完全无关：
-    - 使用独立 SITE_UNLOCK_DETECT / SITE_UNLOCK_CLICK 标签集，不复用 watch_labels
-    - 不调用 watch_rewarded_ads()，不修改、不计入任何 adsCompleted / 广告计数
-    无提示时直接返回 True；解锁失败返回 False（调用方应终止本次服务器任务）。
-    """
-    if page is None:
-        return True
-
-    hit = _site_unlock_present(page)
-    if not hit:
-        log("[站点解锁] 未检测到网站解锁提示，无需处理")
-        return True
-
-    log(f"[站点解锁] 检测到网站解锁提示（{hit}），执行独立解锁流程（此广告不计入任何广告计数）")
-    try:
-        take_screenshot(page, "debug_screenshot_site_unlock_before.png")
-    except Exception:
-        pass
-
-    clicked = click_anywhere(page, SITE_UNLOCK_CLICK, 20000, exact=True)
-    if not clicked:
-        clicked = click_anywhere(page, SITE_UNLOCK_CLICK, 10000, exact=False)
-    if not clicked:
-        log("[站点解锁] 未找到「观看一则短广告」入口，解锁失败")
-        try:
-            take_screenshot(page, "debug_screenshot_site_unlock.png")
-        except Exception:
-            pass
-        return False
-
-    log(f"[站点解锁] 已点击解锁入口（{clicked}），等待广告播放完成…")
-    ad_sec = int(cfg.get("ad_duration_sec") or 32)
-    page.wait_for_timeout(ad_sec * 1000)
-
-    # 广告播完后必须手动点击 Close（与开机/续期广告同一套标签，不计任何广告计数）
-    closed = click_anywhere(page, AD_CLOSE_LABELS, 60000) or click_anywhere(
-        page, AD_CLOSE_LABELS, 15000, exact=False
-    )
-    if closed:
-        log(f"[站点解锁] 已点击广告 Close（{closed}），等待广告层卸载…")
-        page.wait_for_timeout(5000)
-    else:
-        log("[站点解锁] 未找到广告 Close 按钮（可能已自动关闭或仍在播放），继续等待解锁提示消失")
-
-    # 等待解锁提示消失
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        if not _site_unlock_present(page):
-            log("[站点解锁] 解锁提示已消失，网站访问已解锁")
-            return True
-        page.wait_for_timeout(3000)
-
-    # 必要时 reload 后再次确认
-    log("[站点解锁] 提示仍在，reload 后再次确认…")
-    try:
-        page.reload(wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(6000)
-    except Exception:
-        pass
-    if _site_unlock_present(page):
-        log("[站点解锁] reload 后解锁提示仍存在，判定解锁失败")
-        try:
-            take_screenshot(page, "debug_screenshot_site_unlock.png")
-        except Exception:
-            pass
-        return False
-    log("[站点解锁] reload 后解锁提示已消失，网站访问已解锁")
-    return True
-
-
-def _region_shortage_present(page):
-    """是否出现「区域不可用」提示（UI 辅助检测）。REGION_SHORTAGE_DETECT 为空时不检测。"""
-    if not REGION_SHORTAGE_DETECT:
-        return None
-    hit = _text_visible_anywhere(page, REGION_SHORTAGE_DETECT, exact=True)
-    if hit:
-        return hit
-    return _text_visible_anywhere(page, REGION_SHORTAGE_DETECT, exact=False)
-
-
-def _api_region_unavailable(server) -> bool:
-    """纯读取 api_state() 已返回的 server dict，判断后端是否报告区域不可用。
-
-    判定依据（来自 Voer 前端 bundle ServerDetail 组件确认的字段与窗口）：
-    - server.provisioningStatus == "region_unavailable" → 立即 True（主证据）
-    - server.live.regionUnavailable / server.live.regionCapacityLow
-      且 updatedAt 在 REGION_UNAVAILABLE_WINDOW_SEC 内 → True（辅助证据，与前端 ct() 一致）
-    普通 {} / None / 缺字段一律不误判；不发起任何网络请求。
-    """
-    if not isinstance(server, dict):
-        return False
-    if str(server.get("provisioningStatus") or "").strip().lower() == "region_unavailable":
-        return True
-    live = server.get("live")
-    if not isinstance(live, dict):
-        return False
-    for key in ("regionUnavailable", "regionCapacityLow"):
-        val = live.get(key)
-        if not isinstance(val, dict):
-            continue
-        updated = parse_iso(val.get("updatedAt"))
-        if updated is not None:
-            age = time.time() - updated.timestamp()
-            if 0 <= age <= REGION_UNAVAILABLE_WINDOW_SEC:
-                return True
-    return False
-
-
-def _wait_running_or_region_failure(cfg, server_id: str, timeout: int = 180, poll: float = 5):
-    """轮询等待 running；API 报告区域不可用时提前返回（不空等剩余时间）。
-
-    返回 (server, region_failed)。轮询行为与 wait_for_status 一致（超时返回最后一次状态），
-    仅新增 _api_region_unavailable(last) 早退分支。不修改 wait_for_status / api_state。
-    """
-    deadline = time.time() + timeout
-    last = None
-    while time.time() < deadline:
-        try:
-            last = api_state(cfg, server_id)
-        except SystemExit:
-            time.sleep(poll)
-            continue
-        except Exception as e:
-            log(f"轮询状态失败: {e}")
-            time.sleep(poll)
-            continue
-        st = server_status_key(last)
-        if st in RUNNING_STATUSES:
-            return last, False
-        if _api_region_unavailable(last):
-            log(f"等待开机: 当前状态={st or '未知'}（API 报告区域不可用，提前结束等待）")
-            return last, True
-        log(f"等待开机: 当前状态={st or '未知'}")
-        time.sleep(poll)
-    return last, False
-
-
-def _region_failure_info(server):
-    """提取区域失败信息：当前失败 region + Voer 提供的可用候选 region id。
-
-    字段来自 Voer 前端 bundle（ServerDetail 组件）确认的结构：
-    live.regionUnavailable / live.regionCapacityLow，均含 region 与 availableRegions。
-    availableRegions 兼容 ["US", "EU"] 与 [{"id": "US", "available": true}] 两种格式。
-    无法确定失败区域时返回 (None, [])，调用方按 region_shortage 失败处理。
-    """
-    live = server.get("live") if isinstance(server, dict) else None
-    if not isinstance(live, dict):
-        return None, []
-    for key in ("regionUnavailable", "regionCapacityLow"):
-        info = live.get(key)
-        if not isinstance(info, dict):
-            continue
-        failed = info.get("region")
-        if not isinstance(failed, str) or not failed.strip():
-            failed = None
-        candidates = []
-        raw = info.get("availableRegions")
-        if isinstance(raw, list):
-            for item in raw:
-                if isinstance(item, str) and item.strip():
-                    candidates.append(item.strip())
-                elif isinstance(item, dict) and isinstance(item.get("id"), str):
-                    if item.get("available") is False:
-                        continue
-                    candidates.append(str(item["id"]).strip())
-        return failed, list(dict.fromkeys(candidates))
-    return None, []
-
-
-def _get_available_regions(cfg):
-    """GET /api/servers/regions，返回经过基础校验的区域列表。
-
-    复用现有 api_post（不新增 API 层、不改 api_state 行为）；响应非 2xx 或格式异常
-    时返回 None（调用方按 region_shortage 失败处理，不做任何猜测）。
-    """
-    code, data = api_post(cfg, "/api/servers/regions", timeout=30)
-    if code not in (200, 201, 202, 204):
-        log(f"[自动换区] 获取区域列表失败：HTTP {code}，取消换区")
-        return None
-    regions = data.get("regions") if isinstance(data, dict) else None
-    if not isinstance(regions, list):
-        log("[自动换区] 获取区域列表失败：响应格式异常，取消换区")
-        return None
-    return regions
-
-
-def _compute_region_candidates(server, regions, failed_regions):
-    """按 Voer 前端规则求候选：服务器给出的候选 ∩ API available=true 且 checked!=false
-    - 当前失败区域 - 本次运行已失败区域；保持 API 返回顺序，不排序、不设优先级。
-    """
-    failed, offered = _region_failure_info(server)
-    if not failed or not offered:
-        return failed, []
-    failed_regions = set(failed_regions or set())
-    api_ok = set()
-    for r in regions:
-        if not isinstance(r, dict):
-            continue
-        rid = r.get("id")
-        if not isinstance(rid, str) or not rid.strip():
-            continue
-        if r.get("available") is not True:
-            continue
-        if r.get("checked") is False:
-            continue
-        api_ok.add(rid.strip())
-    candidates = []
-    for rid in offered:
-        rid = rid.strip()
-        if rid not in api_ok:
-            continue
-        if rid == failed:
-            continue
-        if rid in failed_regions:
-            continue
-        candidates.append(rid)
-    return failed, candidates
-
-
-def _api_region_switch(cfg, server_id: str, region: str):
-    """PATCH /api/servers/{id}/region，2xx 才算成功；不重新 Start。"""
-    code, data = api_post(
-        cfg, f"/api/servers/{server_id}/region", {"region": region}, timeout=60
-    )
-    if code not in (200, 201, 202, 204):
-        log(f"[自动换区] 区域切换失败：HTTP {code}，取消换区")
-        return None
-    if isinstance(data, dict) and isinstance(data.get("server"), dict):
-        return data["server"]
-    return api_state(cfg, server_id)
-
-
-def _switch_region_and_wait(cfg, server_id: str, server, failed_regions, switch_count):
-    """区域不可用后的自动换区：获取候选 → 选第一个 → PATCH → 继续等 running。
-
-    返回 (server, ok, switch_count)。失败时返回当前 server 与 False，调用方按
-    region_shortage 终止。全程不调用 api_power / click_start_button /
-    watch_rewarded_ads，不重新看 3 个开机广告。
-    """
-    failed_regions = failed_regions if isinstance(failed_regions, set) else set()
-    if switch_count >= MAX_REGION_SWITCHES:
-        log(f"[自动换区] 已达到本次运行最大换区次数（{MAX_REGION_SWITCHES}），停止换区")
-        return server, False, switch_count
-
-    regions = _get_available_regions(cfg)
-    if regions is None:
-        return server, False, switch_count
-    failed, candidates = _compute_region_candidates(server, regions, failed_regions)
-    if not failed:
-        log("[自动换区] 当前区域不可用，但无法确定失败区域，取消换区")
-        return server, False, switch_count
-    log(f"[自动换区] 检测到当前区域不可用")
-    log(f"[自动换区] 当前失败区域: {failed}")
-    if candidates:
-        log(f"[自动换区] Voer 当前提供候选区域: {', '.join(candidates)}")
-    else:
-        log("[自动换区] 当前区域不可用，但 Voer 没有提供其他可用区域")
-        return server, False, switch_count
-    api_ok = [
-        r.get("id")
-        for r in regions
-        if isinstance(r, dict)
-        and isinstance(r.get("id"), str)
-        and r.get("available") is True
-        and r.get("checked") is not False
-    ]
-    if api_ok:
-        log(f"[自动换区] API 当前可用区域: {', '.join(api_ok)}")
-    pick = candidates[0]
-    log(f"[自动换区] 最终选择区域: {pick}")
-    log(f"[自动换区] 正在切换区域: {failed} -> {pick}")
-
-    new_server = _api_region_switch(cfg, server_id, pick)
-    if new_server is None:
-        return server, False, switch_count
-    failed_regions.add(failed)
-    log("[自动换区] 区域切换成功，Voer 将继续自动启动服务器")
-    log("[自动换区] 不重新执行 Start，不重新观看开机广告")
-    log(f"[自动换区] 继续等待服务器进入 running")
-
-    server, region_failed = _wait_running_or_region_failure(cfg, server_id, timeout=180)
-    if server is None:
-        server = api_state(cfg, server_id)
-    if region_failed or _api_region_unavailable(server):
-        log(f"[自动换区] 新区域 {pick} 仍然不可用")
-        log("[自动换区] 重新获取 Voer 最新区域容量")
-        return server, True, switch_count + 1
-    return server, True, switch_count + 1
-
-
-def _region_shortage_check(page, server=None):
-    """区域资源不足检测：API 主检测（server 字段）+ UI 辅助检测（页面文案）。
-
-    命中时记录日志 + 截图 + dump_page_debug。自动换区无候选时调用方据此终止本轮。
-    本函数自身不调用 regions/region API、不点击任何区域按钮。返回命中标识文本；
-    未命中返回 None。
-    """
-    hit = None
-    if server is not None and _api_region_unavailable(server):
-        hit = "api:provisioningStatus=region_unavailable / live.regionUnavailable(CapacityLow)"
-    if hit is None:
-        hit = _region_shortage_present(page)
-    if hit:
-        log(f"[区域资源不足] 检测到提示（{hit}）")
-        try:
-            take_screenshot(page, "debug_screenshot_region_shortage.png")
-        except Exception:
-            pass
-        try:
-            dump_page_debug(page, "区域资源不足")
-        except Exception:
-            pass
-        log("[区域资源不足] 无可用候选区域，任务安全终止，等待下一轮/人工处理")
-    return hit
-
-
 def click_start_button(page) -> str | None:
-    if _site_unlock_present(page):
-        log("[站点解锁] 网站解锁提示仍在，不寻找 Start/开机 按钮（避免误点）")
-        return None
     start_labels = [
         "Start",
         "启动",
@@ -1437,21 +968,12 @@ def click_start_button(page) -> str | None:
     return hit
 
 
-def watch_rewarded_ads(cfg, page, server_id: str, reason: str = "开机/续期") -> int:
+def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
     """点击 Watch ad 并等待播放，返回实际完成的广告数。
 
     与续期流程保持一致：进入广告页 → 循环点击 Watch ad → 等待播放 → Close。
     若第一次点击后广告已在播放，则先等播完再 Close，计入第 1 条。
-
-    注意：这是「开机广告」专用流程，与网站访问解锁广告完全无关。
-    不含 "Watch"/"开始"/"開始" 等泛化标签，避免 has-text 子串匹配
-    误点「观看一则短广告」解锁入口；检测到解锁提示仍在时直接中止。
     """
-    if page is None:
-        return 0
-    if _site_unlock_present(page):
-        log(f"[站点解锁] {reason}: 网站解锁提示仍在，中止广告流程（避免误点/误计解锁广告）")
-        return 0
     watch_labels = [
         "Watch ad",
         "觀看廣告",
@@ -1459,134 +981,67 @@ def watch_rewarded_ads(cfg, page, server_id: str, reason: str = "开机/续期")
         "Watch Ad",
         "Watch ads",
         "Watch Ads",
+        "Watch",
+        "开始",
+        "開始",
     ]
-    close_labels = AD_CLOSE_LABELS
+    close_labels = ["Close", "關閉", "关闭", "×", "X", "Done", "完成"]
+    total = int(cfg.get("ads_per_extension") or 3)
     ad_sec = int(cfg.get("ad_duration_sec") or 32)
     watched = 0
 
-    # 使用新 API 流程：ad-start-prepare → ad-start-nonces → arm → watch → close → reward
-    # 准备广告流程，获取 flowId 和广告进度
-    flow_id = str(uuid.uuid4())
-    code, data = ad_start_prepare(cfg, server_id, flow_id)
-    if code not in (200, 201, 202, 204):
-        log(f"{reason}: ad-start-prepare 失败 HTTP {code}，回退旧流程")
-        # 回退到旧流程
-        page.wait_for_timeout(3000)
-        hit = click_anywhere(page, watch_labels, 30000) or click_anywhere(
-            page, watch_labels, 15000, exact=False
-        )
-        if not hit:
-            log(f"{reason}: 未找到入口 Watch ad，尝试直接寻找可点广告按钮")
-        log(f"{reason}: 等待 Ad ready…")
-        page.wait_for_timeout(8000)
-        total = int(cfg.get("ads_per_extension") or 3)
-        for i in range(1, total + 1):
-            hit = click_anywhere(page, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 75000)
-            if not hit:
-                hit = click_anywhere(page, watch_labels, 20000, exact=False)
-            if not hit:
-                log(f"{reason}: 第 {i} 个 Watch ad 未立刻出现，等待播放/关闭按钮…")
-                page.wait_for_timeout(ad_sec * 1000)
-                closed = click_anywhere(page, close_labels, 45000) or click_anywhere(
-                    page, close_labels, 15000, exact=False
-                )
-                if closed:
-                    watched += 1
-                    log(f"{reason}: 第 {i}/{total} 个广告：已按播放完成关闭（{closed}）")
-                    page.wait_for_timeout(5000)
-                    continue
-                log(f"{reason}: 第 {i} 个 Watch ad 未找到，停止广告流程")
-                break
-
-            watched += 1
-            log(f"{reason}: 已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
-            page.wait_for_timeout(ad_sec * 1000)
-            closed = click_anywhere(page, close_labels, 60000) or click_anywhere(
-                page, close_labels, 15000, exact=False
-            )
-            log(
-                f"{reason}: 第 {i} 个广告:",
-                f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
-            )
-            page.wait_for_timeout(6000)
-
-        log(f"{reason}: 广告流程结束，完成 {watched}/{total} 条")
-        return watched
-
-    log(f"{reason}: ad-start-prepare 成功: flowId={flow_id}")
-    batch_request_id = data.get("batchRequestId", "")
-    completed_ads = data.get("completedAds", 0)
-    ads_required = data.get("adsRequired", 3)
-    log(f"{reason}: 广告进度: {completed_ads}/{ads_required}")
-
-    # 获取 nonce 列表
-    code, data = ad_start_nonces(cfg, server_id, flow_id, count=1)
-    if code not in (200, 201, 202, 204):
-        log(f"{reason}: ad-start-nonces 失败 HTTP {code}，回退旧流程")
-        return watched
-
-    nonces = data.get("ssvNonces", [])
-    if not nonces:
-        log(f"{reason}: 未获取到 nonce，回退旧流程")
-        return watched
-
-    if not batch_request_id:
-        log(f"{reason}: 未获取到 batchRequestId，回退旧流程")
-        return watched
-    nonce = nonces[0] if nonces else ""
-    user_id = _get_user_id(cfg)
-
-    # 点击 Watch ad 进入广告播放
     page.wait_for_timeout(3000)
+    # 进入广告流程
     hit = click_anywhere(page, watch_labels, 30000) or click_anywhere(
         page, watch_labels, 15000, exact=False
     )
-    if not hit:
+    if hit:
+        log(f"{reason}: 已进入广告流程（{hit}）")
+    else:
         log(f"{reason}: 未找到入口 Watch ad，尝试直接寻找可点广告按钮")
     log(f"{reason}: 等待 Ad ready…")
     page.wait_for_timeout(8000)
 
-    # 循环播放剩余广告
-    for ad_index in range(completed_ads + 1, ads_required + 1):
-        if not nonces or (ad_index - 1) >= len(nonces):
-            log(f"{reason}: 第 {ad_index} 个广告: 未获取到 nonce")
+    for i in range(1, total + 1):
+        # 优先点 Watch ad；若点不到，可能上一条还在播，先尝试 Close 再重试
+        hit = click_anywhere(page, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 75000)
+        if not hit:
+            hit = click_anywhere(page, watch_labels, 20000, exact=False)
+        if not hit:
+            # 广告可能已自动开始播放：等待时长后关
+            log(f"{reason}: 第 {i} 个 Watch ad 未立刻出现，等待播放/关闭按钮…")
+            page.wait_for_timeout(ad_sec * 1000)
+            closed = click_anywhere(page, close_labels, 45000) or click_anywhere(
+                page, close_labels, 15000, exact=False
+            )
+            if closed:
+                watched += 1
+                log(f"{reason}: 第 {i}/{total} 个广告：已按播放完成关闭（{closed}）")
+                page.wait_for_timeout(5000)
+                continue
+            log(f"{reason}: 第 {i} 个 Watch ad 未找到，停止广告流程")
             break
 
-        nonce = nonces[ad_index - 1]
-        attempt = 1  # 第一次尝试
-        request_id = _generate_request_id(batch_request_id, ad_index, attempt)
-
-        log(f"{reason}: 第 {ad_index}/{ads_required} 个广告: 调用 arm (requestId={request_id})")
-        arm_code, _ = verify_ad_arm(cfg, server_id, flow_id, nonce, user_id, request_id)
-        if arm_code not in (200, 201, 202, 204):
-            log(f"{reason}: 第 {ad_index} 个广告: arm 失败 HTTP {arm_code}")
-
-        log(f"{reason}: 第 {ad_index} 个广告: 播放中…")
+        watched += 1
+        log(f"{reason}: 已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
         page.wait_for_timeout(ad_sec * 1000)
-
         closed = click_anywhere(page, close_labels, 60000) or click_anywhere(
             page, close_labels, 15000, exact=False
         )
-        if not closed:
-            log(f"{reason}: 第 {ad_index} 个广告: 未找到 Close 按钮")
+        log(
+            f"{reason}: 第 {i} 个广告:",
+            f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
+        )
+        page.wait_for_timeout(6000)
 
-        log(f"{reason}: 第 {ad_index} 个广告: 调用 reward (requestId={request_id})")
-        reward_code, _ = verify_ad_reward(cfg, server_id, flow_id, nonce, request_id, user_id)
-        if reward_code not in (200, 201, 202, 204):
-            log(f"{reason}: 第 {ad_index} 个广告: reward 失败 HTTP {reward_code}")
-
-        watched += 1
-        log(f"{reason}: 第 {ad_index}/{ads_required} 个广告: 完成")
-        page.wait_for_timeout(5000)
-
-    log(f"{reason}: 广告流程结束，完成 {watched} 条")
+    log(f"{reason}: 广告流程结束，完成 {watched}/{total} 条")
     return watched
 
 
 def restart_via_panel(cfg, page, reason: str = "关机后重启", server_id: str | None = None) -> int:
     """在面板点击 Start/开机并看激励广告。
 
-    返回完成的广告数。广告完成后后端自动启动服务器，不再调用 /start API。
+    返回完成的广告数。若传入 server_id，广告结束后会带 adsCompleted 再调一次 start API。
     """
     if page is None:
         return 0
@@ -1596,10 +1051,24 @@ def restart_via_panel(cfg, page, reason: str = "关机后重启", server_id: str
         return 0
     log(f"{reason}: 已点击开机入口: {hit}")
     page.wait_for_timeout(2500)
-    watched = watch_rewarded_ads(cfg, page, server_id or "", reason=reason)
+    watched = watch_rewarded_ads(cfg, page, reason=reason)
 
-    # 广告完成后后端自动启动，不再调用 /start API
-    log(f"{reason}: 广告已完成，后端将自动启动服务器")
+    # 广告看完后，用 adsCompleted 再请求一次开机（平台要求）
+    if server_id:
+        n = max(watched, int(cfg.get("ads_per_extension") or 3))
+        for ads_n in (n, 3, 2, 1):
+            log(f"{reason}: 广告后再次 API start（adsCompleted={ads_n}）")
+            code, data = api_power(cfg, server_id, "start", {"adsCompleted": ads_n})
+            if code in (200, 201, 202, 204):
+                log(f"{reason}: API start 已接受（adsCompleted={ads_n}）")
+                break
+            if not ads_required_error(code, data):
+                # 非广告错误，再试 restart
+                code2, _ = api_power(cfg, server_id, "restart")
+                if code2 in (200, 201, 202, 204):
+                    log(f"{reason}: API restart 已接受")
+                    break
+            page.wait_for_timeout(1500)
     return watched
 
 
@@ -1611,27 +1080,14 @@ def ads_required_error(code, data) -> bool:
 
 
 def ensure_running(cfg, server_id: str, page=None):
-    """检查电源状态；若为 stopped/offline 则开机。
+    """仅检查是否关机：若为 stopped/offline 则开机或重启。
 
-    返回 (server, did_power, outcome)，outcome 为：
-      already_running    本来就是 running（脚本未做任何动作）
-      external_running   脚本未确认发起过开机，但观察到 running（用户/其他因素）
-      powered_by_script  脚本自身发起的开机动作被接受（API 2xx，或面板 Start 后状态
-                         实际进入 provisioning/starting），并最终进入 running
-      region_shortage    provisioning 期间检测到「区域资源不足」提示（本轮不自动换区）
-      start_failed       最终未进入 running（含跳过开机且未 running 的情况）
-
-    因果原则：「最终看到 running」不等于「脚本成功开机」。
-    只有脚本自己的开机动作被接受、状态随后离开 stopped 进入 starting/provisioning、
-    再最终进入 running，才返回 did_power=True；否则一律归为 external_running。
+    其他状态（running / starting / crashed 等）一律不处理。
+    返回 (server, did_power_on)。开机失败只记日志，不抛异常。
     """
     skip = str(os.environ.get("VOER_SKIP_RESTART", "")).strip().lower() in ("1", "true", "yes")
     if skip or not cfg.get("restart_if_stopped", True):
-        server = api_state(cfg, server_id)
-        if is_running(server):
-            return server, False, "already_running"
-        log("已配置跳过开机，且服务器未运行 → 本次任务终止")
-        return server, False, "start_failed"
+        return api_state(cfg, server_id), False
 
     server = api_state(cfg, server_id)
     st = server_status_key(server)
@@ -1640,34 +1096,23 @@ def ensure_running(cfg, server_id: str, page=None):
     # 只处理明确关机/离线
     if not is_stopped(server):
         if is_running(server):
-            log("服务器已在运行中，无需开机（脚本未发起开机）")
-            return server, False, "already_running"
-        if is_starting(server):
-            log("服务器启动中（非脚本发起），等待就绪…")
-            server, region_failed = _wait_running_or_region_failure(
-                cfg, server_id, timeout=360
-            )
-            if server is None:
-                server = api_state(cfg, server_id)
-            if is_running(server):
-                log("等待后进入 running：非脚本发起的开机 → external_running")
-                return server, False, "external_running"
-            shortage = _region_shortage_check(page, server)
-            if shortage or region_failed:
-                return server, False, "region_shortage"
-            log(f"等待后仍未 running（当前: {server_status_key(server) or '未知'}）→ 本次任务终止")
-            return server, False, "start_failed"
-        log(f"当前状态非关机（{st or '未知'}），不执行开机/重启 → 本次任务终止")
-        return server, False, "start_failed"
+            log("服务器已在运行中，无需开机")
+        elif is_starting(server):
+            log("服务器启动中，等待就绪…")
+            server = wait_for_status(cfg, server_id, RUNNING_STATUSES, timeout=360) or server
+        else:
+            log(f"当前状态非关机（{st or '未知'}），跳过开机/重启")
+        return server, False
 
     log("检测到关机/离线：执行开机或重启")
-    own_action_accepted = False
+    accepted = False
     need_ads = False
     for act in ("start", "restart"):
         log(f"发送电源指令: {act}")
-        code, data = api_power(cfg, server_id, act)
+        extra = {"adsCompleted": 0} if act == "start" else {}
+        code, data = api_power(cfg, server_id, act, extra)
         if code in (200, 201, 202, 204):
-            own_action_accepted = True
+            accepted = True
             if isinstance(data, dict) and data.get("server"):
                 server = data["server"]
             break
@@ -1677,32 +1122,19 @@ def ensure_running(cfg, server_id: str, page=None):
             break
         log(f"{act} 未成功，尝试下一指令")
 
-    if need_ads or not own_action_accepted:
+    if need_ads or not accepted:
         if page is not None:
             restart_via_panel(cfg, page, reason="关机后开机", server_id=server_id)
-            # 仅点击 Start 不足以证明开机成功：用状态变化确认动作被接受
-            try:
-                cur = api_state(cfg, server_id)
-            except (SystemExit, Exception):
-                cur = server
-            if server_status_key(cur) in STARTING_STATUSES:
-                own_action_accepted = True
-                log("面板开机后状态已进入 provisioning/starting，确认脚本动作被接受")
-                server = cur
         elif need_ads:
-            log("开机需要看广告，但当前没有浏览器会话，无法完成开机 → 本次任务终止")
-            return server, False, "start_failed"
+            log("开机需要看广告，但当前没有浏览器会话，无法完成开机")
+            return server, False
 
-    # 广告/指令后等待进入 running（区域不可用则自动换区后继续等待）
-    failed_regions = set()
-    switch_count = 0
-    log("[自动换区] 开机流程完成，服务器进入 provisioning")
-    server, region_failed = _wait_running_or_region_failure(cfg, server_id, timeout=180)
-    if server is None:
-        server = api_state(cfg, server_id)
+    # 广告/指令后等待进入 running（缩短空等：若一直 stopped 则提前结束再重试）
+    server = wait_for_status(cfg, server_id, RUNNING_STATUSES, timeout=180) or api_state(
+        cfg, server_id
+    )
 
-    # 保持原逻辑：非区域原因失败时允许一次面板重试；区域失败直接进入换区
-    if not is_running(server) and not region_failed and not _api_region_unavailable(server) and page is not None:
+    if not is_running(server) and page is not None:
         log("开机后仍未运行，再试一次面板开机+广告")
         try:
             page.reload(wait_until="domcontentloaded", timeout=60000)
@@ -1710,46 +1142,19 @@ def ensure_running(cfg, server_id: str, page=None):
         except Exception:
             pass
         restart_via_panel(cfg, page, reason="关机后开机（重试）", server_id=server_id)
-        try:
-            cur = api_state(cfg, server_id)
-        except (SystemExit, Exception):
-            cur = server
-        if server_status_key(cur) in STARTING_STATUSES:
-            own_action_accepted = True
-        server, region_failed = _wait_running_or_region_failure(
-            cfg, server_id, timeout=180
-        )
-        if server is None:
-            server = api_state(cfg, server_id)
-
-    # 统一处理：running → 结束；region_unavailable → 换区后继续等；其他 → 失败
-    while not is_running(server):
-        if region_failed or _api_region_unavailable(server):
-            server, ok, switch_count = _switch_region_and_wait(
-                cfg, server_id, server, failed_regions, switch_count
-            )
-            if not ok:
-                shortage = _region_shortage_check(page, server)
-                return server, False, "region_shortage"
-            region_failed = False
-            continue
-        shortage = _region_shortage_check(page, server)
-        if shortage:
-            return server, False, "region_shortage"
-        break
+        server = wait_for_status(
+            cfg, server_id, RUNNING_STATUSES, timeout=180
+        ) or api_state(cfg, server_id)
 
     if is_running(server):
-        if own_action_accepted:
-            log("开机完成：脚本发起的开机被接受并最终 running（did_power=True）")
-            return server, True, "powered_by_script"
-        log("观察到 running，但无法确认由脚本开机导致（did_power=False, external_running）")
-        return server, False, "external_running"
+        log("开机完成，服务器已在运行")
+        return server, True
 
     log(
-        f"开机最终失败：服务器仍未 running（当前状态: {server_status_key(server) or '未知'}），"
-        "本次任务终止（不再进入 Extend/续期）"
+        f"开机后服务器仍未运行（当前状态: {server_status_key(server) or '未知'}），"
+        "不报错，继续后续流程"
     )
-    return server, False, "start_failed"
+    return server, False
 
 
 def load_config():
@@ -2182,6 +1587,9 @@ def run_server(cfg, server_id, account=""):
         "Watch Ad",
         "Watch ads",
         "Watch Ads",
+        "Watch",
+        "开始",
+        "開始",
     ]
     extend_labels = [
         "延伸",
@@ -2252,54 +1660,8 @@ def run_server(cfg, server_id, account=""):
                     log(f"已点同意弹窗: {hit}")
                     break
 
-            # ===== 网站访问解锁（独立流程，绝不计入开机/续期广告计数）=====
-            if not ensure_site_unlock(cfg, page):
-                log("[站点解锁] 解锁失败，终止本次服务器任务（不进入开机/续期）")
-                try:
-                    dump_page_debug(page, "站点解锁失败")
-                except Exception:
-                    pass
-                try:
-                    notify(
-                        cfg,
-                        "❌ Voer 站点解锁失败",
-                        [
-                            f"服务器: <code>{short_id}</code>",
-                            "原因: 「观看一则短广告」解锁未完成，面板不可操作",
-                            "请查看 Actions 日志或 site_unlock 截图",
-                        ],
-                        photo=pathlib.Path(_shot_name("debug_screenshot_site_unlock.png")),
-                    )
-                except Exception as e:
-                    log(f"解锁失败通知发送失败（不影响结果）: {e}")
-                return False
-
             # 只检查是否关机：关机则开机/重启（不抛错）
-            before, did_power, outcome = ensure_running(cfg, server_id, page=page)
-            log(f"开机结果: outcome={outcome}, did_power={did_power}")
-
-            if outcome in ("start_failed", "region_shortage"):
-                fail_title = (
-                    "❌ Voer 开机失败，本次任务终止"
-                    if outcome == "start_failed"
-                    else "⚠️ Voer 检测到区域资源不足，本次任务终止"
-                )
-                log(f"{fail_title}（不进入 Extend/续期）")
-                shot = take_screenshot(page, "debug_screenshot_start_failed.png")
-                try:
-                    notify_godlike(
-                        cfg,
-                        account,
-                        short_id,
-                        fail_title,
-                        seconds_until(before.get("sessionExpiresAt")),
-                        before.get("status"),
-                        photo=shot,
-                        remaining_text="—",
-                    )
-                except Exception as e:
-                    log(f"终止通知发送失败（不影响结果）: {e}")
-                return False
+            before, did_power = ensure_running(cfg, server_id, page=page)
             if did_power:
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=60000)
@@ -2365,23 +1727,6 @@ def run_server(cfg, server_id, account=""):
             # ===== 单次运行内连续续期：每轮 = 点延伸 + 看 3 个广告 + 验证 +4h =====
             for round_no in range(1, max_ext + 1):
                 cur = api_state(cfg, server_id)
-
-                # Extend 前置守卫：服务器必须真正 running 才允许续期
-                if not is_running(cur):
-                    shortage = _region_shortage_check(page, cur)
-                    if shortage:
-                        stop_reason = f"检测到区域资源不足（{shortage}），本轮不自动换区，任务终止"
-                        log(f"{stop_reason}（不点击 Extend、不执行任何广告）")
-                        now = cur
-                        break
-                    stop_reason = (
-                        f"服务器未运行（当前: {server_status_key(cur) or '未知'}），"
-                        "不进入 Extend/续期"
-                    )
-                    log(f"{stop_reason}，结束续期流程")
-                    now = cur
-                    break
-
                 q = quota(cur)
                 used_today = q["used_today"]
                 session_ext = q["session_ext"]
