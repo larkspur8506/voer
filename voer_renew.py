@@ -82,14 +82,20 @@ STOPPING_STATUSES = {"stopping"}
 # ---------------------------------------------------------------------------
 # 网站访问解锁弹窗（登录后偶现）：独立标签集，与开机广告 / Extend 续期 3 广告完全隔离。
 # 该广告只是「网站级 24h 访问解锁」，绝不计入任何 adsCompleted / 广告计数。
-# 检测文案来自实际页面确认的中文原文；英文文案待真实 DOM 确认后再补充。
+# 检测文案来自实际页面确认的中英文原文，仅使用完整、明确的文案，
+# 不加入 Watch/View/Ad/Unlock/Continue 等泛化词。
 SITE_UNLOCK_DETECT = [
     "解锁更多内容",
     "请做出选择以便继续访问此网站上的内容",
     "获得 24 小时的网站级访问权限",
+    "Unlock more content",
+    "Take action to continue accessing the content on this site",
+    "View a short ad",
+    "Site-wide access for 24 hours",
 ]
 SITE_UNLOCK_CLICK = [
     "观看一则短广告",
+    "View a short ad",
 ]
 
 # ---------------------------------------------------------------------------
