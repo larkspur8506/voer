@@ -924,20 +924,23 @@ def is_starting(server) -> bool:
     return server_status_key(server) in STARTING_STATUSES
 
 
-def api_post(cfg, path: str, payload=None, timeout: int = 60, base_url: str = "https://voer.host"):
+def api_post(cfg, path: str, payload=None, timeout: int = 60, base_url: str = "https://voer.host", extra_headers: dict | None = None):
     """POST voer API。返回 (status_code, body_dict)。失败不 sys.exit。"""
     url = path if path.startswith("http") else f"{base_url}{path}"
     body = json.dumps(payload if payload is not None else {}).encode()
+    headers = {
+        "Cookie": f"token={cfg['token']}",
+        "Authorization": f"Bearer {cfg['token']}",
+        "User-Agent": UA,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     req = urllib.request.Request(
         url,
         data=body,
-        headers={
-            "Cookie": f"token={cfg['token']}",
-            "Authorization": f"Bearer {cfg['token']}",
-            "User-Agent": UA,
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        },
+        headers=headers,
         method="POST",
     )
     try:
@@ -972,7 +975,15 @@ def ad_start_prepare(cfg, server_id: str, flow_id: str) -> tuple:
 
 def ad_start_nonces(cfg, server_id: str, flow_id: str, count: int = 1) -> tuple:
     """POST /api/servers/{id}/ad-start-nonces。"""
-    return api_post(cfg, f"/api/servers/{server_id}/ad-start-nonces", {"flowId": flow_id, "count": count})
+    return api_post(
+        cfg,
+        f"/api/servers/{server_id}/ad-start-nonces",
+        {"flowId": flow_id, "count": count},
+        extra_headers={
+            "Origin": "https://voer.host",
+            "Referer": f"https://voer.host/panel/server/{server_id}",
+        },
+    )
 
 
 def _get_user_id(cfg) -> str:
