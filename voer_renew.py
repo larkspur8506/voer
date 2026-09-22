@@ -2,7 +2,8 @@
 """
 Voer.host 免费服务器会话续期（Playwright 版）
 
-原理：免费档会话制（默认 4h），续期需看完 3 个 Google 激励广告 -> +4h。
+原理：免费档会话制（默认 4h），需看完平台要求的多个（当前 4 个）Google 激励广告 -> +4h。
+广告数量以服务端返回的 adsRequired 为准，不再硬编码。
 按钮在跨进程 iframe（wormies.voer.host / googleads.g.doubleclick.net）里，
 必须用 Playwright（原生支持 OOPIF）才能点到，Selenium/JS 无法穿透。
 
@@ -50,7 +51,7 @@ DEFAULT_CONFIG = {
     "token": "在这里填浏览器 Cookie 里 voer.host 的 token 值（JWT）",
     "email": "",          # 可选；token 过期时用邮箱+密码登录并自动刷新 token
     "password": "",       # 可选；对应 VOER_PASSWORD
-    "ads_per_extension": 3,
+    "ads_per_extension": 4,   # 仅本地默认/兜底；实际数量以服务端 adsRequired 为准
     "ad_duration_sec": 32,
     "extensions_per_run": 4,   # 单次运行内最多连续续期几次（受平台每日/每会话 4 次上限约束）
     "restart_if_stopped": True,  # 关机/离线时先重启，就绪后再续期
@@ -1201,6 +1202,122 @@ def api_power(cfg, server_id: str, action: str, extra=None):
     return code, data
 
 
+def ad_start_prepare(cfg, server_id: str, flow_id: str | None = None):
+    """POST /api/servers/{id}/ad-start-prepare：准备/恢复「开机激励广告」流程。
+
+    返回 (code, data)。data 顶层含 adsRequired / completedAds / flowId（purpose=server_start）。
+    传 flow_id 可恢复未完成的流程（服务端返回续接后的 completedAds）。
+    """
+    payload = {"flowId": flow_id} if flow_id else {}
+    return api_post(cfg, f"/api/servers/{server_id}/ad-start-prepare", payload)
+
+
+def ad_start_complete(cfg, server_id: str, flow_id: str | None = None):
+    """POST /api/servers/{id}/ad-start-complete：广告完成后提交，后端据此自动开机。"""
+    payload = {"flowId": flow_id} if flow_id else {}
+    return api_post(cfg, f"/api/servers/{server_id}/ad-start-complete", payload)
+
+
+def _ad_flow_counts(data):
+    """从 ad-start-prepare 返回中解析 (adsRequired, completedAds, flowId)。
+
+    优先顶层字段（purpose=server_start），缺失时回退到
+    server.live.adStartFlow / server.access.adPolicy.requiredRewardedAdCount。
+    adsRequired 取不到时返回 None（由调用方决定回退），completedAds 取不到时返回 0。
+    """
+    d = data if isinstance(data, dict) else {}
+    req = d.get("adsRequired")
+    done = d.get("completedAds")
+    fid = d.get("flowId")
+    srv = d.get("server") if isinstance(d.get("server"), dict) else None
+    if isinstance(srv, dict):
+        live = srv.get("live") if isinstance(srv.get("live"), dict) else {}
+        flow = live.get("adStartFlow") if isinstance(live.get("adStartFlow"), dict) else {}
+        if req is None:
+            req = flow.get("adsRequired")
+        if done is None:
+            done = flow.get("completedAds")
+        if not fid:
+            fid = flow.get("flowId")
+        if req is None:
+            access = srv.get("access") if isinstance(srv.get("access"), dict) else {}
+            policy = access.get("adPolicy") if isinstance(access, dict) else {}
+            if isinstance(policy, dict):
+                req = policy.get("requiredRewardedAdCount")
+    try:
+        req = int(req) if req is not None else None
+    except Exception:
+        req = None
+    try:
+        done = int(done) if done is not None else 0
+    except Exception:
+        done = 0
+    return req, done, fid
+
+
+def extend_ads_required(cfg, state=None) -> int:
+    """续期（session_extension）本次要完成的广告数：优先取 API 动态值。
+
+    顺序：进行中的 sessionExtensionFlow.adsRequired → access.adPolicy.requiredRewardedAdCount
+    → 任意 sessionExtensionFlow.adsRequired → 本地 cfg（兜底，不是硬编码 3）。
+    与开机流程（server_start）相互独立，不共用 flow。
+    """
+    st = state if isinstance(state, dict) else {}
+    flow = st.get("sessionExtensionFlow") if isinstance(st.get("sessionExtensionFlow"), dict) else {}
+    if str(flow.get("status") or "").lower() in (
+        "prepared",
+        "in_progress",
+        "in-progress",
+        "started",
+        "playing",
+    ):
+        try:
+            v = int(flow.get("adsRequired"))
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    access = st.get("access") if isinstance(st.get("access"), dict) else {}
+    policy = access.get("adPolicy") if isinstance(access, dict) else {}
+    if isinstance(policy, dict):
+        try:
+            v = int(policy.get("requiredRewardedAdCount"))
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    try:
+        v = int(flow.get("adsRequired"))
+        if v > 0:
+            return v
+    except Exception:
+        v = None
+    return v or int(cfg.get("ads_per_extension") or 3)
+
+
+def _existing_ad_start_flow_id(cfg, server_id):
+    """读取 server.live.adStartFlow 中当前「未完成」的 flowId，用于续接面板正在进行的 flow。
+
+    终态（completed/expired/failed/cancelled/applied）或 flowId 不存在时返回 None，
+    允许调用方新建 flow；读取失败同样返回 None。
+    """
+    terminal = {"completed", "expired", "failed", "cancelled", "canceled", "applied"}
+    try:
+        server = api_state(cfg, server_id)
+    except SystemExit:
+        return None
+    except Exception as e:
+        log(f"读取已有 adStartFlow flowId 失败: {e}")
+        return None
+    live = server.get("live") if isinstance(server.get("live"), dict) else {}
+    flow = live.get("adStartFlow") if isinstance(live.get("adStartFlow"), dict) else {}
+    fid = flow.get("flowId")
+    status = str(flow.get("status") or "").strip().lower()
+    if fid and status not in terminal:
+        return fid
+    return None
+
+
 def wait_for_status(cfg, server_id: str, want, timeout: int = 300, poll: float = 5):
     """轮询直到 status 落入 want 集合，超时返回最后一次状态。"""
     want = {str(x).lower() for x in want}
@@ -1538,8 +1655,12 @@ def _test_dump_final(page, tag: str = "TEST_FINAL"):
     log(f"----- [TEST] 诊断结束 [{tag}] -----")
 
 
-def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
+def watch_rewarded_ads(cfg, page, reason: str = "开机/续期", total=None, start_index: int = 1) -> int:
     """点击 Watch ad 并等待播放，返回实际完成的广告数。
+
+    total 为 None 时回退到本地 cfg（兜底）；调用方会传入服务端 ad-start-prepare
+    返回的 adsRequired，因此不再固定为 3。start_index 为恢复续接起始序号
+    （completedAds + 1），range 支持任意数量（含 4）。
 
     流程：
       1. 进入广告流程（点击面板上的 Watch ad 入口）
@@ -1561,8 +1682,15 @@ def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
         "开始",
         "開始",
     ]
-    total = int(cfg.get("ads_per_extension") or 3)
+    if not total:
+        total = int(cfg.get("ads_per_extension") or 3)
+    total = int(total)
+    start_index = max(1, int(start_index or 1))
     watched = 0
+
+    if start_index > total:
+        log(f"{reason}: 服务端进度已达 {start_index - 1}/{total}，无需再看广告")
+        return watched
 
     page.wait_for_timeout(3000)
     # 进入广告流程
@@ -1582,7 +1710,7 @@ def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
 
     log(f"{reason}: 检测到 Wormies frame，开始逐条广告")
 
-    for i in range(1, total + 1):
+    for i in range(start_index, total + 1):
         # ── 进入当前广告前：确认 wormies frame 存在 ──
         wormies = _get_wormies_frames(page)
         if not wormies:
@@ -1709,7 +1837,9 @@ def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
 def restart_via_panel(cfg, page, reason: str = "关机后重启", server_id: str | None = None) -> int:
     """在面板点击 Start/开机并看激励广告。
 
-    返回完成的广告数。若传入 server_id，广告结束后会带 adsCompleted 再调一次 start API。
+    返回完成的广告数。若传入 server_id：开机广告数量以 ad-start-prepare 返回的
+    adsRequired 为准，恢复时从 completedAds+1 续接；completedAds 达标后调用
+    ad-start-complete，由后端自动开机（不再使用旧的 start {adsCompleted: N} 流程）。
     """
     if page is None:
         return 0
@@ -1763,8 +1893,17 @@ def restart_via_panel(cfg, page, reason: str = "关机后重启", server_id: str
         # 测试模式：不触发正式 API start，只跑广告流程
         pass
     elif test_mode == "all":
-        # ── AD_TEST_MODE=all：完整跑通 3 条广告流程（不含正式续期）──
+        # ── AD_TEST_MODE=all：完整跑通服务端要求数量的广告流程（不含正式续期）──
         total_ads = int(cfg.get("ads_per_extension") or 3)
+        if server_id:
+            try:
+                tc, tp = ad_start_prepare(cfg, server_id)
+                treq, tdone, _tf = _ad_flow_counts(tp)
+                if treq:
+                    total_ads = treq
+                    log(f"[TEST] all 模式：服务端要求 {total_ads} 条广告（已完成 {tdone}）")
+            except Exception as e:
+                log(f"[TEST] all 模式：ad-start-prepare 失败，回退本地数量: {e}")
         log(f"[TEST] all 模式：将测试 {total_ads} 条广告完整流程")
         for i in range(1, total_ads + 1):
             log(f"[TEST] ========== 第 {i}/{total_ads} 条广告 ==========")
@@ -1810,25 +1949,97 @@ def restart_via_panel(cfg, page, reason: str = "关机后重启", server_id: str
     elif test_mode == "rounds":
         log("[TEST] rounds 模式将在 run_server 广告循环里执行")
 
-    watched = watch_rewarded_ads(cfg, page, reason=reason)
-
-    # 广告看完后，用 adsCompleted 再请求一次开机（平台要求）
+    # ── 新版开机广告流程：数量只认服务端 adsRequired ──
+    # 首次 prepare 前先复用面板当前未完成的 adStartFlow flowId，避免新建与面板并行的 flow。
+    ads_required = None
+    completed_ads = 0
+    flow_id = None
+    prepare_ok = False
     if server_id:
-        n = max(watched, int(cfg.get("ads_per_extension") or 3))
-        for ads_n in (n, 3, 2, 1):
-            log(f"{reason}: 广告后再次 API start（adsCompleted={ads_n}）")
-            code, data = api_power(cfg, server_id, "start", {"adsCompleted": ads_n})
-            if code in (200, 201, 202, 204):
-                log(f"{reason}: API start 已接受（adsCompleted={ads_n}）")
-                break
-            if not ads_required_error(code, data):
-                # 非广告错误，再试 restart
-                code2, _ = api_power(cfg, server_id, "restart")
-                if code2 in (200, 201, 202, 204):
-                    log(f"{reason}: API restart 已接受")
-                    break
-            page.wait_for_timeout(1500)
-    return watched
+        flow_id = _existing_ad_start_flow_id(cfg, server_id)
+        if flow_id:
+            log(f"{reason}: 续接面板当前 adStartFlow flowId={str(flow_id)[:8]}…")
+        try:
+            pc, pdata = ad_start_prepare(cfg, server_id, flow_id)
+            if pc in (200, 201, 202, 204):
+                srv_req, srv_done, srv_fid = _ad_flow_counts(pdata)
+                if srv_req is not None:
+                    ads_required = srv_req
+                completed_ads = srv_done
+                if srv_fid:  # 优先采用服务端返回的权威 flowId（初次创建或续接确认）
+                    flow_id = srv_fid
+                if ads_required is not None and flow_id:
+                    prepare_ok = True
+        except Exception as e:
+            log(f"{reason}: ad-start-prepare 失败（服务端数量未知）: {e}")
+        if ads_required is not None:
+            log(f"{reason}: 服务端要求 {ads_required} 个广告（已完成 {completed_ads}）")
+        else:
+            log(f"{reason}: 服务端未返回 adsRequired，仅播放/轮询，禁止按本地数量判定达标")
+
+    # 从 completedAds+1 续接（total=None 时仅用本地默认数量兜底“播放”，不用于达标判定）
+    watched = watch_rewarded_ads(
+        cfg, page, reason=reason, total=ads_required, start_index=completed_ads + 1
+    )
+
+    if not server_id:
+        return watched
+
+    # 达标只认服务端：
+    # 1. 必须有有效 flowId
+    # 2. prepare 必须成功且明确返回 adsRequired
+    # 3. 只能在服务端明确确认 completedAds >= adsRequired 时调用 ad_start_complete
+    # 否则一律不 complete，交给上层重试机制。
+    server_required = ads_required
+    server_completed = completed_ads
+    flow_ok = bool(flow_id)
+    satisfied = False
+    deadline = time.time() + 120
+    first_poll = True
+    while first_poll or time.time() < deadline:
+        first_poll = False
+        try:
+            qc, qdata = ad_start_prepare(cfg, server_id, flow_id)
+            if qc in (200, 201, 202, 204):
+                r1, d1, f1 = _ad_flow_counts(qdata)
+                if r1 is not None:
+                    server_required = r1
+                server_completed = d1
+                if f1:
+                    flow_id = f1
+                    flow_ok = True
+                if server_required is not None and flow_ok:
+                    prepare_ok = True
+        except Exception as e:
+            log(f"{reason}: 轮询广告进度失败: {e}")
+        if prepare_ok and flow_ok and server_required and server_completed >= server_required:
+            satisfied = True
+            break
+        if time.time() >= deadline:
+            break
+        page.wait_for_timeout(5000)
+
+    if satisfied and prepare_ok and flow_ok and server_required and server_completed >= server_required:
+        log(
+            f"{reason}: 服务端确认达标（completedAds={server_completed}/{server_required}），"
+            "提交 ad-start-complete，等待后端自动开机"
+        )
+        try:
+            cc, _cd = ad_start_complete(cfg, server_id, flow_id)
+            log(f"{reason}: ad-start-complete: HTTP {cc}")
+        except Exception as e:
+            log(f"{reason}: ad-start-complete 失败: {e}")
+    elif not prepare_ok or not flow_ok or not server_required:
+        log(
+            f"{reason}: 服务端未明确 flowId/adsRequired（flowId={'有' if flow_ok else '缺失'}, "
+            f"adsRequired={server_required}, prepare_ok={prepare_ok}），禁止提交 complete，等待上层重试"
+        )
+    else:
+        log(
+            f"{reason}: 进度未达标（completedAds={server_completed}/{server_required}），禁止提交 complete，"
+            f"等待后续重试（下次从 completedAds+1={server_completed + 1} 续接）"
+        )
+    return max(watched, server_completed)
 
 
 def ads_required_error(code, data) -> bool:
@@ -1868,7 +2079,9 @@ def ensure_running(cfg, server_id: str, page=None):
     need_ads = False
     for act in ("start", "restart"):
         log(f"发送电源指令: {act}")
-        extra = {"adsCompleted": 0} if act == "start" else {}
+        # 不再附带旧的 adsCompleted 字段：需要广告时由下方 restart_via_panel 走
+        # ad-start-prepare / ad-start-complete 新流程
+        extra = {}
         code, data = api_power(cfg, server_id, act, extra)
         if code in (200, 201, 202, 204):
             accepted = True
@@ -2258,7 +2471,7 @@ def test_ad_flow(cfg, page, reason: str = "广告测试"):
     """临时测试模式：验证广告入口和轮次切换，不修改正式逻辑。
 
     AD_TEST_MODE=first   → 只测第 1 个广告入口（进入→等 wormies→点 Watch ad→退出）
-    AD_TEST_MODE=rounds  → 测完整 3 轮（每轮完成后重新等待新 wormies frame）
+    AD_TEST_MODE=rounds  → 测完整流程（轮数以服务端 adsRequired 为准，每轮完成后重新等待新 wormies frame）
     """
     test_mode = os.environ.get("AD_TEST_MODE", "").strip().lower()
     if test_mode not in ("first", "rounds"):
@@ -2311,37 +2524,46 @@ def test_ad_flow(cfg, page, reason: str = "广告测试"):
         log("[TEST] 第一条广告入口测试成功，停止测试")
         return True
 
-    # ── rounds 模式：循环 3 条广告，验证每轮 wormies frame 重新出现 ──
-    for i in range(1, 4):
+    # ── rounds 模式：轮数优先服务端 adsRequired（开机流程），回退本地 cfg，验证每轮 wormies frame 重新出现 ──
+    total_rounds = int(cfg.get("ads_per_extension") or 3)
+    try:
+        rcode, rdata = ad_start_prepare(cfg, cfg["server_id"])
+        rreq, rdone, _rf = _ad_flow_counts(rdata)
+        if rreq:
+            total_rounds = rreq
+            log(f"[TEST] rounds：服务端要求 {total_rounds} 条广告（已完成 {rdone}）")
+    except Exception as e:
+        log(f"[TEST] rounds：ad-start-prepare 失败，回退本地数量: {e}")
+    for i in range(1, total_rounds + 1):
         # 等待 wormies frame
         wormies = _get_wormies_frames(page)
         if not wormies:
-            log(f"[TEST] 第 {i}/3 条广告前：等待新的 Wormies frame…")
+            log(f"[TEST] 第 {i}/{total_rounds} 条广告前：等待新的 Wormies frame…")
             wormies = _wait_for_wormies_frame(page, timeout_sec=60)
             if not wormies:
-                log(f"[TEST] 第 {i}/3 条广告等待 Wormies frame 超时，测试停止")
+                log(f"[TEST] 第 {i}/{total_rounds} 条广告等待 Wormies frame 超时，测试停止")
                 break
-        log(f"[TEST] 第 {i}/3 条：Wormies frame 已就绪")
+        log(f"[TEST] 第 {i}/{total_rounds} 条：Wormies frame 已就绪")
 
         # 在 wormies frame 里找 Watch ad
         ad_hit = click_in_frames(wormies, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 30000)
         if ad_hit:
-            log(f"[TEST] 第 {i}/3 条：已点击 Watch ad: {ad_hit}")
+            log(f"[TEST] 第 {i}/{total_rounds} 条：已点击 Watch ad: {ad_hit}")
         else:
-            log(f"[TEST] 第 {i}/3 条：Wormies frame 中未找到 Watch ad（可能已开始）")
+            log(f"[TEST] 第 {i}/{total_rounds} 条：Wormies frame 中未找到 Watch ad（可能已开始）")
 
         # 等待 wormies frame 卸载（广告完成）
-        log(f"[TEST] 第 {i}/3 条：等待 Wormies frame 卸载…")
+        log(f"[TEST] 第 {i}/{total_rounds} 条：等待 Wormies frame 卸载…")
         end = time.time() + 180
         gone = False
         while time.time() < end:
             if not _get_wormies_frames(page):
                 gone = True
-                log(f"[TEST] 第 {i}/3 条：Wormies frame 已卸载，广告完成")
+                log(f"[TEST] 第 {i}/{total_rounds} 条：Wormies frame 已卸载，广告完成")
                 break
             time.sleep(3)
         if not gone:
-            log(f"[TEST] 第 {i}/3 条：等待 wormies frame 卸载超时")
+            log(f"[TEST] 第 {i}/{total_rounds} 条：等待 wormies frame 卸载超时")
             break
 
         # 短暂停顿后进入下一轮（frame 消失后会自动重新出现）
@@ -2674,7 +2896,10 @@ def run_server(cfg, server_id, account=""):
                     log("[TEST] 测试模式结束，正常退出")
                     return True
 
-                total = int(cfg["ads_per_extension"])
+                # 续期广告数量：优先 API 动态值（session_extension 流程独立于开机），
+                # 不再固定为 3；取不到时才回退本地 cfg
+                total = extend_ads_required(cfg, cur)
+                log(f"{reason}: 本轮续期需完成 {total} 个广告")
                 # 记住本轮开始时的主面板 URL，用于校验是否成功回到主面板
                 main_url_at_start = page.url
                 log(f"{reason}: 等待 Wormies frame 出现…")
